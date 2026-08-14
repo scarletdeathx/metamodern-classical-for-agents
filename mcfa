@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Repository-local MCFA launcher; installation is optional."""
+
+from pathlib import Path
+import os
+import sys
+
+ROOT = Path(__file__).resolve().parent
+VENV = ROOT / ".venv"
+VENV_PYTHON = VENV / "bin" / "python"
+
+# Once the documented local environment exists, every future task gets the
+# audible dependencies automatically even when it invokes ./mcfa directly.
+arguments = sys.argv[1:]
+needs_audio_runtime = "devices" in arguments or "start" in arguments
+if needs_audio_runtime and VENV_PYTHON.exists() and Path(sys.prefix).resolve() != VENV.resolve():
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT / "src"))
+
+from mcfa.cli import main
+
+raise SystemExit(main())
