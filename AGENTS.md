@@ -383,13 +383,13 @@ When the agent environment offers a recurring-loop, self-wake, heartbeat, or
 equivalent continuation facility, use that facility throughout every active
 timed performance. Before relying on it, consult that environment's own help or
 documentation for its syntax, minimum cadence, session lifetime, wakeup rules,
-and stop mechanism. Start one recurring conductor prompt immediately after
-arming the Python deadline, at a fixed cadence short enough to make meaningful
-live decisions and permitted by that environment. The prompt must direct each
-wakeup to inspect current state and recent history, make one substantive musical
-decision (or deliberately retain a compelling state), verify the result, and
-continue conducting. Its completion condition must be status evidence that the
-Python deadline has faded the engine to a safe stopped state.
+and stop mechanism. Before arming it, prove that a wakeup can still send input to
+the same persistent `./mcfa session` and use the required status tools. If it
+cannot, do not claim that the loop can conduct this set: keep control with the
+current capable agent or report that the harness lacks the necessary persistent
+tool access. Once that readiness gate passes, start one recurring conductor
+prompt immediately after arming the Python deadline, at a fixed cadence short
+enough to make meaningful live decisions and permitted by that environment.
 
 This facility is only the agent's recurring control cycle. The Python deadline
 remains the sole hard end time: never use a loop as a second duration timer,
@@ -407,12 +407,24 @@ different commands and semantics.
 The recurring prompt is a control handoff: after a capable agent has opened the
 engine, persistent `./mcfa session`, and deadline, a modest local model must be
 able to conduct the already-running performance without rediscovering the whole
-project. Give it the conductor session identity and this small, imperative
-contract in every wakeup: (1) obtain compact status plus recent history; (2)
-preserve the existing engine and deadline; (3) send one coherent session command
-or a small atomic batch; (4) obtain status again; (5) end only when the stopped
-state is proven. It must operate the existing conductor session, not launch a
-new per-edit CLI process or audio engine.
+project. Give it the conductor session identity and this literal, imperative
+contract in every wakeup (substitute the environment's native completion signal
+for `LOOP_COMPLETE` where needed):
+
+```text
+You are continuing the live MCFA performance through conductor session <ID>.
+Do not start an engine or another conductor session. Do not change its deadline.
+1. Send {"command":"status","history":24} to <ID>.
+2. Choose exactly one allowed lane decision below and send it to <ID>.
+3. Send {"command":"status","history":24} again and verify that decision
+   was applied.
+4. If status proves the Python deadline has stopped the engine, emit
+   LOOP_COMPLETE; otherwise remain available for the next recurring wakeup.
+Do not merely describe a change: send the actual conductor command.
+```
+
+It must operate the existing conductor session, not launch a new per-edit CLI
+process or audio engine.
 
 Limit each wakeup to one of these concrete decisions: leave one compelling lane
 alone; spawn or restart one inactive lane; rewrite one active or killed lane;
@@ -424,7 +436,9 @@ describe what it would do. Keep gains moderate, preserve unrelated free clocks,
 and never panic or alter the deadline except on the explicit conditions defined
 elsewhere in this file. This bounded action vocabulary lets a weak local model
 make safe, audible decisions while the persistent mixer retains timing and
-safety authority.
+safety authority. A hold is allowed only once consecutively and only when recent
+history already proves a successful lane action; the next wakeup must send a
+verified lane command.
 
 ### Continuous conducting, not a pre-shaped arc
 
