@@ -377,6 +377,55 @@ for Python; maintain only a short horizon of pending events and keep making live
 choices. Treat new user messages during playback as immediate directions without
 resetting the existing deadline unless requested.
 
+### Autonomous agent loop
+
+When the agent environment offers a recurring-loop, self-wake, heartbeat, or
+equivalent continuation facility, use that facility throughout every active
+timed performance. Before relying on it, consult that environment's own help or
+documentation for its syntax, minimum cadence, session lifetime, wakeup rules,
+and stop mechanism. Start one recurring conductor prompt immediately after
+arming the Python deadline, at a fixed cadence short enough to make meaningful
+live decisions and permitted by that environment. The prompt must direct each
+wakeup to inspect current state and recent history, make one substantive musical
+decision (or deliberately retain a compelling state), verify the result, and
+continue conducting. Its completion condition must be status evidence that the
+Python deadline has faded the engine to a safe stopped state.
+
+This facility is only the agent's recurring control cycle. The Python deadline
+remains the sole hard end time: never use a loop as a second duration timer,
+restart the engine merely because a loop fires, or replace an existing deadline
+unless the user explicitly requests it. If the environment's minimum cadence is
+longer than the set, conduct directly in the initial turn and rely on the Python
+deadline; do not pretend a later wakeup will occur before it ends. Respect the
+environment's session and loop limits—for example, Hermes Agent supports one
+idle-session `/loop` at a time, a fixed cadence configurable down to 30 seconds,
+and `LOOP_COMPLETE` as an agent-controlled stop signal. Other harnesses may use
+different commands and semantics.
+
+### Low-capability loop conductor
+
+The recurring prompt is a control handoff: after a capable agent has opened the
+engine, persistent `./mcfa session`, and deadline, a modest local model must be
+able to conduct the already-running performance without rediscovering the whole
+project. Give it the conductor session identity and this small, imperative
+contract in every wakeup: (1) obtain compact status plus recent history; (2)
+preserve the existing engine and deadline; (3) send one coherent session command
+or a small atomic batch; (4) obtain status again; (5) end only when the stopped
+state is proven. It must operate the existing conductor session, not launch a
+new per-edit CLI process or audio engine.
+
+Limit each wakeup to one of these concrete decisions: leave one compelling lane
+alone; spawn or restart one inactive lane; rewrite one active or killed lane;
+mute, unmute, or hard-kill one lane; or make a small batch that changes a few
+lanes together. Select the decision from observed lane count, clocks, recent
+history, and the user's latest sound world—not from a need to narrate a complete
+composition. It must use actual lane commands and verify their result, not only
+describe what it would do. Keep gains moderate, preserve unrelated free clocks,
+and never panic or alter the deadline except on the explicit conditions defined
+elsewhere in this file. This bounded action vocabulary lets a weak local model
+make safe, audible decisions while the persistent mixer retains timing and
+safety authority.
+
 ### Continuous conducting, not a pre-shaped arc
 
 The central performance idea is an AI continuously conducting a changing ecology
