@@ -9,6 +9,11 @@ description = "A persistent, agent-conducted metamodern noise-performance instru
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
+classifiers = [
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+]
 dependencies = [
   "numpy>=1.24,<3",
   "sounddevice>=0.5,<1",

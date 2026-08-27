@@ -1,5 +1,9 @@
 # Metamodern Classical for Agents (MCFA)
 
+> **Platform requirement:** MCFA currently works on macOS only. Its audible
+> engine and process control are built around CoreAudio and macOS Unix sockets;
+> Windows and Linux are not supported.
+
 MCFA is a persistent local noise-performance instrument for macOS. One Python
 process owns CoreAudio, the master mix, deadlines, fades, state, and panic. Inside
 that supervised mixer are ten independently controllable sound-machine lanes.
@@ -14,6 +18,9 @@ or GUI. It is optimized for Codex rapidly operating many strange overlapping
 processes.
 
 ## Install once
+
+You need macOS and Python 3.10 or newer. These installation instructions are not
+expected to produce a working instrument on Windows or Linux.
 
 The repository launcher automatically uses `.venv` for every engine startup when
 the environment exists:
@@ -160,6 +167,18 @@ History records both scheduling and application with an event ID, audio frame,
 time, beat, affected lanes, fade, changed fields, pattern size/preview, and synth
 summary. It persists into the final saved state, so a stopped performance remains
 auditable.
+
+## Agent automation cadence
+
+MCFA is intended for active, automation-forward conducting rather than loading a
+pattern and leaving it untouched. The default agent protocol inspects the running
+state every 1–3 seconds and makes a verified lane intervention or small batch
+roughly every 2–6 seconds, targeting 10–30 substantive interventions per minute.
+Local-model turns should produce perceptible reconfiguration—often a coherent
+2–4-lane batch—not spend their tokens on invisible parameter nudges. Faster
+continuous motion belongs inside lanes through LFOs, probability, independent
+clocks, modulation, and effects rather than a flood of control commands. Slower
+or more disruptive intervention rates can be requested in ordinary language.
 
 ## Deadlines, fades, and panic
 

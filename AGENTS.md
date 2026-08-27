@@ -92,6 +92,11 @@ than one vague request for a genre. Include the mode menu with its short emotive
 descriptions. Let the user answer with terse words, option numbers, multiple
 choices, ranges, or `skip`; do not demand music theory knowledge.
 
+If the current agent harness offers checkbox or multi-select prompts, use them
+for the intake and preserve the ability to choose several answers. Do not flatten
+combination-friendly fields into mutually exclusive choices merely because a
+form control is available. Use compact numbered text only as the fallback.
+
 ### Ready-to-play creative presets
 
 The following presets are shortcuts through the creative intake. A request such
@@ -377,6 +382,51 @@ for Python; maintain only a short horizon of pending events and keep making live
 choices. Treat new user messages during playback as immediate directions without
 resetting the existing deadline unless requested.
 
+### Automation and intervention cadence
+
+This is an automation-forward instrument. Unless the user asks for stable,
+minimal, or slow-changing behavior, use this default control cadence during an
+active set:
+
+- inspect and reconsider the current state about every 1–3 seconds;
+- apply and verify a meaningful one-lane command or small multi-lane batch about
+  every 2–6 seconds;
+- rotate attention across lanes instead of repeatedly polishing one lane while
+  the rest become a static backing track;
+- revisit each important audible identity within roughly 10–20 seconds, whether
+  the decision is to mutate it, interrupt it, replace it, automate it internally,
+  or consciously preserve it while another process changes.
+
+For a one-minute set, this normally yields around 10–30 verified interventions,
+often affecting two to four lanes at once, plus the continuous behavior already
+inside the lane patches. Do not let a whole local-model inference cycle culminate
+in a nearly inaudible parameter nudge. Spend that reasoning on a coherent batch,
+lifecycle action, pattern replacement, clock conflict, register move, source
+change, or clearly animated modulation. This is a responsiveness target, not an
+excuse for arbitrary edits: every action should have a plausible audible effect.
+
+Interpret **"lots of automation," "automation-forward,"** or **"near-constant
+disruption"** as a denser two-scale behavior. Use small agent gestures every
+1–3 seconds when the conductor and audio health permit, while making larger
+structural or lifecycle changes about every 4–10 seconds. Use lane-local LFOs,
+probability, asymmetric patterns, effects, and clock drift for continuous or
+sub-second motion; do not simulate audio-rate automation by flooding the session
+with CLI commands. Conversely, **"steady mutations"** suggests an action about
+every 6–12 seconds, and **"occasional large changes"** about every 15–30 seconds.
+
+The user should not hear only three or four total shifts in a minute-long
+automation-forward set. Unless a deliberate hold, exposed silence, or stable
+process was requested, avoid an idle span longer than about eight seconds without
+a consequential applied lane change. Status and history prove commands and
+configuration, not perception, so use the user's hearing as the final test of
+whether these interventions actually read as distinct changes.
+
+Cadence must remain elastic. Slow material may receive frequent subtle automation
+without sounding hurried, while ruthless churn may hard-replace lanes rapidly.
+Back off command frequency if underruns grow, events are still pending, or status
+shows the engine cannot apply changes cleanly. The user's auditory feedback and
+explicit intervention-rate request override all numeric defaults.
+
 ### Autonomous agent loop
 
 When the agent environment offers a recurring-loop, self-wake, heartbeat, or
@@ -391,16 +441,31 @@ tool access. Once that readiness gate passes, start one recurring conductor
 prompt immediately after arming the Python deadline, at a fixed cadence short
 enough to make meaningful live decisions and permitted by that environment.
 
-This facility is only the agent's recurring control cycle. The Python deadline
-remains the sole hard end time: never use a loop as a second duration timer,
-restart the engine merely because a loop fires, or replace an existing deadline
-unless the user explicitly requests it. If the environment's minimum cadence is
-longer than the set, conduct directly in the initial turn and rely on the Python
-deadline; do not pretend a later wakeup will occur before it ends. Respect the
-environment's session and loop limits—for example, Hermes Agent supports one
-idle-session `/loop` at a time, a fixed cadence configurable down to 30 seconds,
-and `LOOP_COMPLETE` as an agent-controlled stop signal. Other harnesses may use
-different commands and semantics.
+This facility is only the agent's recurring control cycle: it tells the harness
+how often to return the agent to the still-running performance so it can inspect
+state and make a fresh decision. The Python deadline remains the sole hard end
+time. Never use a recurring wakeup as a second duration timer, restart the engine
+merely because the agent wakes, or replace an existing deadline unless the user
+explicitly requests it. If the environment cannot wake before the set ends,
+conduct directly in the initial turn and rely on the Python deadline; do not
+pretend a later wakeup will occur in time.
+
+Hermes Agent may expose this behavior as a natural-language `/loop` slash command,
+but do not assume its syntax, minimum cadence, concurrency limit, persistence, or
+completion signal. Check the installed Hermes help at runtime and use only the
+semantics it actually reports. If `/loop` is documented, invoke the literal
+leading-slash harness command in the Hermes chat interface with a natural-language
+recurring prompt. It is not an MCFA pattern loop, an `./mcfa` subcommand, session
+JSON, or a shell loop, and it must never be sent to the conductor socket. Treat
+`/heartbeat`, when a harness documents that name, as the same general class of
+harness-level wakeup facility—not as an MCFA command—while independently checking
+its syntax and behavior.
+
+A recurring facility is adequate only if its observed wake cadence can meet the
+requested intervention rate and still operate the same conductor session. If it
+cannot, the capable agent must conduct directly at the required cadence while it
+retains tool access. A slower wakeup may provide backup inspection, but do not
+represent it as the primary automation conductor.
 
 ### Low-capability loop conductor
 
@@ -408,18 +473,22 @@ The recurring prompt is a control handoff: after a capable agent has opened the
 engine, persistent `./mcfa session`, and deadline, a modest local model must be
 able to conduct the already-running performance without rediscovering the whole
 project. Give it the conductor session identity and this literal, imperative
-contract in every wakeup (substitute the environment's native completion signal
-for `LOOP_COMPLETE` where needed):
+contract in every wakeup. Replace `<HARNESS_COMPLETION_SIGNAL>` only with a
+completion signal explicitly documented by that environment; if none exists,
+stop or disable the recurring facility by its documented mechanism:
 
 ```text
 You are continuing the live MCFA performance through conductor session <ID>.
 Do not start an engine or another conductor session. Do not change its deadline.
 1. Send {"command":"status","history":24} to <ID>.
-2. Choose exactly one allowed lane decision below and send it to <ID>.
+2. Choose one coherent allowed lane intervention below and send it to <ID>. When
+   the recent music has been static, prefer a small batch changing 2–4 lanes.
 3. Send {"command":"status","history":24} again and verify that decision
    was applied.
 4. If status proves the Python deadline has stopped the engine, emit
-   LOOP_COMPLETE; otherwise remain available for the next recurring wakeup.
+   <HARNESS_COMPLETION_SIGNAL> if the harness documents one; otherwise use its
+   documented stop mechanism. If still running, remain available for the next
+   recurring wakeup.
 Do not merely describe a change: send the actual conductor command.
 ```
 
@@ -432,13 +501,15 @@ mute, unmute, or hard-kill one lane; or make a small batch that changes a few
 lanes together. Select the decision from observed lane count, clocks, recent
 history, and the user's latest sound world—not from a need to narrate a complete
 composition. It must use actual lane commands and verify their result, not only
-describe what it would do. Keep gains moderate, preserve unrelated free clocks,
-and never panic or alter the deadline except on the explicit conditions defined
-elsewhere in this file. This bounded action vocabulary lets a weak local model
-make safe, audible decisions while the persistent mixer retains timing and
-safety authority. A hold is allowed only once consecutively and only when recent
-history already proves a successful lane action; the next wakeup must send a
-verified lane command.
+describe what it would do. A local-model turn is expensive performance time: if
+one small field change would not plausibly register, use one atomic batch to make
+a related 2–4-lane reconfiguration instead. Keep gains moderate, preserve
+unrelated free clocks, and never panic or alter the deadline except on the
+explicit conditions defined elsewhere in this file. This bounded action
+vocabulary lets a weak local model make safe, audible decisions while the
+persistent mixer retains timing and safety authority. A hold is allowed only once
+consecutively and only when recent history already proves a successful lane
+action; the next wakeup must send a verified consequential command.
 
 ### Continuous conducting, not a pre-shaped arc
 
@@ -541,7 +612,12 @@ requires a one-minute actively conducted session in which:
 - multiple lanes are killed, rewritten/replaced, and revived while others keep
   running;
 - immediate/free and quantized/sync transitions both occur;
-- the user hears clearly different ongoing changes;
+- history contains at least ten substantive applied interventions, with at least
+  six changing pattern, lifecycle, clock, source, register, or density rather
+  than only mix-level fields;
+- there is no unplanned automation gap longer than eight seconds;
+- the user hears clearly different ongoing changes throughout, not merely three
+  or four shifts across the minute;
 - persistent history proves the decisions and timing;
 - CoreAudio has no meaningful underruns;
 - the Python deadline fades to master zero and stops safely;

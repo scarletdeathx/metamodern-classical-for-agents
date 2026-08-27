@@ -14,6 +14,14 @@ choices, `either`, or `skip`. Follow up only when an answer is internally
 contradictory or would materially change the experience. Never require the user
 to answer every item.
 
+When the agent environment provides checkbox, multi-select, form, or other
+structured-choice UI, prefer it for this intake. Enable multiple selections for
+fields that welcome combinations, especially mode, timbre, compositional
+practice, beat vocabulary, and must-include material. Do not force an exclusive
+radio-button choice where the palette permits several answers. Keep a free-text
+path for metaphors and unlisted preferences. If structured UI is unavailable,
+fall back to the compact numbered/text format described above.
+
 For scheduled performances, collect several acceptable answers where possible.
 On each run, select a distinct combination, then keep conducting dynamically;
 do not merely choose one palette and render it as a fixed arrangement. Preserve
@@ -27,7 +35,7 @@ explicit dislikes and safety constraints across every combination.
 4. **Clock relationships:** synchronized, polymetric, unrelated, drifting, or mixed?
 5. **Density:** skeletal, spacious, busy, saturated, or constantly breathing in and out?
 6. **Turnover:** stable identities, gradual mutation, frequent replacement, or ruthless churn?
-7. **Intervention rate:** occasional large changes, steady mutations, or near-constant disruption?
+7. **Intervention rate:** occasional large changes (15–30 seconds), steady mutations (6–12 seconds), automation-forward (2–6 seconds), or near-constant disruption (1–3 second gestures plus larger changes)?
 8. **Pitch versus noise:** mostly pitched, balanced, mostly noise, or changing over time?
 9. **Root or tonal center:** a note, several competing centers, no center, or choose for me?
 10. **Mode or pitch language:** choose one or several from the menu below.
