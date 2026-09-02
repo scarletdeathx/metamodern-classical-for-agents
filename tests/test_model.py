@@ -69,6 +69,54 @@ class NoteAndPatternTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
                 lane.update({"random_seed": invalid})
 
+    def test_v2_rng_domains_are_validated_and_public(self):
+        lane = Channel(id=3)
+        lane.update(
+            {
+                "rng": {
+                    "decision": {"mode": "seeded", "algorithm": "philox", "seed": "0x1234"},
+                    "sound": {"mode": "seeded", "algorithm": "lfsr15", "seed": 7},
+                }
+            }
+        )
+        public = lane.public()
+        self.assertIsNone(public["random_seed"])
+        self.assertEqual(public["rng"]["decision"]["label"], "Orthogonal Lysis")
+        self.assertEqual(public["rng"]["decision"]["seed"], "0x00000000000000000000000000001234")
+        self.assertEqual(public["rng"]["sound"]["label"], "Circuit Bender")
+
+    def test_v2_tsotchke_source_has_user_and_provenance_names(self):
+        lane = Channel(id=1)
+        lane.update(
+            {
+                "rng": {
+                    "sound": {
+                        "mode": "fresh",
+                        "algorithm": "chacha20",
+                        "source": "tsotchke-local",
+                        "seed": 7,
+                        "provenance": {"source_revision": "abc"},
+                    }
+                }
+            }
+        )
+        sound = lane.public()["rng"]["sound"]
+        self.assertEqual(sound["source_label"], "Decoherence Engine")
+        self.assertEqual(sound["provenance"]["source_revision"], "abc")
+
+    def test_v2_rng_rejects_mixed_legacy_and_invalid_domains(self):
+        lane = Channel(id=1)
+        with self.assertRaisesRegex(ValidationError, "either legacy random_seed or v2 rng"):
+            lane.update({"random_seed": 4, "rng": {"sound": {"mode": "off"}}})
+        for value in (
+            {"sound": {"mode": "seeded", "algorithm": "pcg64dxsm"}},
+            {"sound": {"mode": "unknown"}},
+            {"sound": {"algorithm": "divine-intervention"}},
+            {"sound": "Queue Chiral"},
+        ):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                Channel(id=1).update({"rng": value})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "sources": {
+    "tsotchke_quantum_rng": {
+      "url": "https://github.com/tsotchke/quantum_rng.git",
+      "revision": "1a77e77f803c63883349b658361c06401cd8ceb7",
+      "license": "MIT",
+      "role": "local state-vector RNG engine under evaluation"
+    },
+    "tsotchke_quantum_rng_api": {
+      "url": "https://github.com/Tsotchke-Corporation/Quantum-RNG-API.git",
+      "revision": "b02c7039ca40f5975cafb0c147beb4bdbc9202bc",
+      "license": "MIT",
+      "role": "reference bridge and provenance; not an MCFA runtime service"
+    },
+    "eshkol": {
+      "url": "https://github.com/tsotchke/eshkol.git",
+      "revision": "a619b41c6e0cb59fa2002534c20e7ccdddfed155",
+      "license": "MIT",
+      "role": "candidate local entropy-transformation language/runtime"
+    }
+  }
+}

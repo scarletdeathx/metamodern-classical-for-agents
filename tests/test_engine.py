@@ -211,6 +211,122 @@ class SynthEngineTests(unittest.TestCase):
         seeded = next(entry for entry in history if entry["phase"] == "scheduled")
         self.assertEqual(seeded["decision"]["random_seed"], expected_seed)
 
+    def test_v2_fresh_system_domains_resolve_once_and_are_auditable(self):
+        engine = self.make_engine()
+        with mock.patch(
+            "mcfa.providers.system.os.urandom",
+            side_effect=[(0x1111).to_bytes(16, "big"), (0x2222).to_bytes(16, "big")],
+        ):
+            engine.schedule(
+                "set",
+                {
+                    "channel": 1,
+                    "patch": {
+                        "rng": {
+                            "decision": {"mode": "fresh", "algorithm": "philox", "source": "system"},
+                            "sound": {"mode": "fresh", "algorithm": "chacha20", "source": "system"},
+                        }
+                    },
+                },
+                fade=0,
+            )
+        rng = engine.status()["channels"][0]["rng"]
+        self.assertEqual(rng["decision"]["seed"], "0x00000000000000000000000000001111")
+        self.assertEqual(rng["sound"]["seed"], "0x00000000000000000000000000002222")
+        history_rng = engine.status()["history"][0]["decision"]["rng"]
+        self.assertEqual(history_rng["decision"]["seed"], "0x00000000000000000000000000001111")
+        self.assertEqual(history_rng["sound"]["seed"], "0x00000000000000000000000000002222")
+
+    def test_v2_fresh_tsotchke_seed_is_resolved_off_audio_thread(self):
+        from mcfa.providers import EntropyChunk
+
+        chunk = EntropyChunk(
+            data=bytes.fromhex("00112233445566778899aabbccddeeff"),
+            provider="tsotchke-local",
+            execution="local-state-vector-simulation",
+            entropy_origin="conditioned-host-os-cpu",
+            engine_version="3.0.0",
+            source_revision="1a77e77",
+        )
+        engine = self.make_engine()
+        with mock.patch("mcfa.providers.tsotchke.read_tsotchke_entropy", return_value=chunk) as read:
+            engine.schedule(
+                "set",
+                {
+                    "channel": 1,
+                    "patch": {
+                        "rng": {
+                            "sound": {
+                                "mode": "fresh",
+                                "algorithm": "chacha20",
+                                "source": "tsotchke-local",
+                            }
+                        }
+                    },
+                },
+                fade=0,
+            )
+        read.assert_called_once_with(16)
+        sound = engine.status()["channels"][0]["rng"]["sound"]
+        self.assertEqual(sound["source_label"], "Decoherence Engine")
+        self.assertEqual(sound["seed"], "0x00112233445566778899aabbccddeeff")
+        self.assertEqual(sound["provenance"]["source_revision"], "1a77e77")
+
+    def test_v2_noise_consumption_does_not_perturb_decision_stream(self):
+        rng = {
+            "decision": {"mode": "seeded", "algorithm": "philox", "seed": 1234},
+            "sound": {"mode": "seeded", "algorithm": "pcg64dxsm", "seed": 5678},
+        }
+        noisy = self.make_engine()
+        quiet = self.make_engine()
+        noisy.schedule(
+            "set",
+            {
+                "channel": 1,
+                "patch": {
+                    "rng": rng,
+                    "pattern": compact("C3 C3 C3 C3"),
+                    "synth": {"waveform": "noise"},
+                },
+            },
+            fade=0,
+        )
+        quiet.schedule(
+            "set",
+            {
+                "channel": 1,
+                "patch": {
+                    "rng": rng,
+                    "pattern": compact("C3 C3 C3 C3"),
+                    "synth": {"waveform": "sine"},
+                },
+            },
+            fade=0,
+        )
+        noisy.render(2000)
+        quiet.render(2000)
+        self.assertEqual(
+            list(noisy.channels[0].decision_rng.random(32)),
+            list(quiet.channels[0].decision_rng.random(32)),
+        )
+
+    def test_v2_decision_consumption_does_not_perturb_sound_stream(self):
+        patch = {
+            "rng": {
+                "decision": {"mode": "seeded", "algorithm": "chacha20", "seed": 3},
+                "sound": {"mode": "seeded", "algorithm": "philox", "seed": 4},
+            }
+        }
+        first = self.make_engine()
+        second = self.make_engine()
+        first.schedule("set", {"channel": 1, "patch": patch}, fade=0)
+        second.schedule("set", {"channel": 1, "patch": patch}, fade=0)
+        first.channels[0].decision_rng.random(1000)
+        self.assertEqual(
+            list(first.channels[0].sound_rng.random(64)),
+            list(second.channels[0].sound_rng.random(64)),
+        )
+
     def test_dense_ten_lane_renderer_stays_faster_than_realtime(self):
         if synth_module._np is None:
             self.skipTest("production real-time benchmark requires the installed NumPy runtime")

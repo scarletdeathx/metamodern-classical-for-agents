@@ -6,4 +6,6 @@ __pycache__/
 build/
 dist/
 .mcfa/
+.dependency-work/
 /IDEA.md
+.DS_Store

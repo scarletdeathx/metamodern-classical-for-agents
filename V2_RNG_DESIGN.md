@@ -2,6 +2,37 @@
 
 The performer-facing selection guide and deliberately fictionalized source
 personas live in [`V2_RNG_USER_RUBRIC.md`](V2_RNG_USER_RUBRIC.md).
+The concrete Braket/Qiskit agent integration and qRNG circuit contract live in
+[`V2_QRNG_PROVIDER_DRAFT.md`](V2_QRNG_PROVIDER_DRAFT.md).
+
+## Current beta implementation status
+
+The first classical Python slice is implemented behind the opt-in lane `rng`
+patch while the v1 `random_seed` path remains compatible:
+
+- independent `decision` and `sound` streams per lane;
+- `derived`, `seeded`, `fresh` (one control-plane seed), and `off` modes;
+- Queue Chiral (`pcg64dxsm`), Orthogonal Lysis (`philox`), Cliodynamic
+  Threnody (`chacha20`), Circuit Bender (`lfsr15`), and the v1
+  `legacy-mt19937` compatibility generator;
+- exact hexadecimal resolved seeds in status and history;
+- one-shot `--rng-json` plus the existing session JSON patch path; and
+- replay, validation, domain-isolation, and real-time regression tests.
+
+Listener lane wiring, capture/replay files, mixed sources, physical-QPU
+providers, and chain entropy are not yet implemented. The beta now contains a
+bounded background `EntropyReservoir` and a `SystemEntropyProvider`; these are
+tested infrastructure and are intentionally not exposed as a completed Listener
+mode until lane consumption, fallback, and history reporting are connected.
+
+The first local simulated-qRNG slice is also implemented for development:
+`fresh` domains may use `source: "tsotchke-local"`. MCFA draws 16 bytes from a
+locally compiled, pinned Tsotchke `quantum_rng` v3 library on the control plane,
+records the byte hash and source provenance, and uses that value as the seed for
+the selected lane-local algorithm. It performs no HTTP request and does not call
+the native engine from the audio callback. The native source is now distributed
+as a minimal MIT-licensed tracked snapshot. Direct lane streaming and capture
+artifacts remain future work.
 
 ## Purpose
 
@@ -119,6 +150,8 @@ status.
   independently during a performance.
 - Route every stochastic synthesis implementation through one framework-owned
   lane entropy interface.
+- Present performer-facing behavioral names first and technical algorithm/source
+  identifiers as optional parenthetical detail; persist only canonical IDs.
 - Make deterministic replay the default and live entropy an explicit choice.
 - Never call `SystemRandom`, `os.urandom`, a device, or a network source from the
   CoreAudio callback.
@@ -215,6 +248,8 @@ must not be presented as interchangeable concepts.
 Initial entropy provider families:
 
 - `system`: the operating system CSPRNG, reached through `secrets`/`os.urandom`;
+- `tsotchke-local`: the pinned, locally compiled state-vector engine, currently
+  accepted only as a one-seed `fresh` source;
 - `file`: an explicitly configured byte device or recorded entropy file;
 - `capture`: a previously recorded MCFA entropy stream for replay;
 - `plugin:<name>`: a local hardware, sensor, service, or experimental adapter;
@@ -437,3 +472,16 @@ must use independent domains even though that means the output differs from v1.
   before use, preserving source contribution while protecting against weak or
   biased adapters.
 - Which render settings belong in the formal cross-machine replay contract.
+
+## Reservoir foundation implemented in the beta
+
+`mcfa.providers.EntropyReservoir` establishes the control/audio boundary for
+delivery slice 3. Provider reads occur on a background producer or explicit
+control-plane refill. Its consumer method only copies available bytes and
+returns starvation immediately; it never invokes the provider or waits for I/O.
+Status includes capacity, delivered and missing byte counts, refill/provider
+failure counters, the most recent chunk provenance, and a rolling stream digest.
+
+This foundation does not yet alter lane audio. Exposing `mode: "stream"`
+requires a defined starvation transform, capture manifest, lane consumption-rate
+reporting, and history events first.

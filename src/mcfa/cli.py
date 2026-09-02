@@ -20,12 +20,14 @@ from .model import (
     MAX_CHANNELS,
     MODULATION_TARGETS,
     MODULATION_WAVEFORMS,
+    RNG_MODES,
     WAVEFORMS,
     ValidationError,
     parse_pattern,
     pattern_from_json,
     validate_channel_id,
 )
+from .rng import ALGORITHMS, FRIENDLY_ALGORITHM_NAMES
 
 
 def default_state_dir() -> Path:
@@ -225,6 +227,7 @@ def _compact_saved_state(state: dict[str, Any], history_limit: int) -> dict[str,
                 "bpm": channel.get("bpm", state.get("bpm", 120)),
                 "step_beats": channel.get("step_beats", 0.25),
                 "random_seed": channel.get("random_seed"),
+                "rng": channel.get("rng"),
                 "loop_steps": channel.get("loop_steps", len(channel.get("pattern", []))),
                 "loop_seconds": channel.get("loop_seconds", 0.0),
                 "waveform": synth.get("waveform", "sine"),
@@ -396,6 +399,13 @@ def command_set(args: argparse.Namespace) -> int:
         value = getattr(args, name, None)
         if value is not None:
             patch[name] = value
+    if args.rng_json is not None:
+        if args.random_seed is not None:
+            raise ValidationError("use either --random-seed or --rng-json, not both")
+        value = json.loads(args.rng_json)
+        if not isinstance(value, dict):
+            raise ValidationError("--rng-json must be a JSON object")
+        patch["rng"] = value
     if args.pattern is not None and args.pattern_json is not None:
         raise ValidationError("use either --pattern or --pattern-json, not both")
     if args.pattern is not None:
@@ -592,6 +602,20 @@ def command_schema(_args: argparse.Namespace) -> int:
             "pan": "-1..1",
             "step_beats": "0.015625..16",
             "random_seed": "integer/0x hex seed, 'system' for SystemRandom entropy, or 'default'; status returns exact 0x hex",
+            "rng": {
+                "note": "v2 opt-in; decision and sound streams are isolated; cannot be combined with random_seed",
+                "modes": sorted(RNG_MODES),
+                "algorithms": [
+                    {"id": algorithm, "label": FRIENDLY_ALGORITHM_NAMES[algorithm]}
+                    for algorithm in sorted(ALGORITHMS)
+                ],
+                "domain": {
+                    "mode": "derived, seeded, fresh (one control-plane seed), or off",
+                    "algorithm": "canonical algorithm id",
+                    "seed": "integer/0x hex; required for seeded, resolved by engine for fresh",
+                    "source": "system or tsotchke-local for fresh mode",
+                },
+            },
             "pattern": "list of steps",
             "synth": {
                 "waveform": sorted(WAVEFORMS),
@@ -774,6 +798,7 @@ def build_parser() -> argparse.ArgumentParser:
     set_parser.add_argument("--length", type=int, choices=range(1, 257), help="pad the supplied pattern to this loop length")
     set_parser.add_argument("--step-beats", type=float)
     set_parser.add_argument("--random-seed", help="integer seed, 'system', or 'default'")
+    set_parser.add_argument("--rng-json", help="v2 decision/sound RNG object as JSON")
     set_parser.add_argument("--volume", type=float)
     set_parser.add_argument("--pan", type=float)
     mute_group = set_parser.add_mutually_exclusive_group()

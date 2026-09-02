@@ -32,6 +32,7 @@ from .model import (
     validate_bpm,
     validate_channel_id,
 )
+from .rng import build_stream, derive_seed
 
 
 EPSILON = 1e-9
@@ -43,6 +44,47 @@ def _resolve_random_seed_patch(patch: dict[str, Any]) -> None:
     value = patch.get("random_seed")
     if isinstance(value, str) and value.strip().lower() == "system":
         patch["random_seed"] = _SYSTEM_RANDOM.getrandbits(128)
+
+
+def _resolve_rng_patch(patch: dict[str, Any]) -> None:
+    """Resolve v2 fresh domains on the control plane before scheduling."""
+    value = patch.get("rng")
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        return  # The model returns the canonical validation error.
+    for name in ("decision", "sound"):
+        domain = value.get(name)
+        if not isinstance(domain, dict):
+            continue
+        if str(domain.get("mode", "")).strip().lower() == "fresh" and "seed" not in domain:
+            source = str(domain.get("source", "system")).strip().lower()
+            if source == "system":
+                from .providers.system import SystemEntropyProvider
+
+                chunk = SystemEntropyProvider().read(16)
+                seed = int.from_bytes(chunk.data, "big")
+                domain["source"] = "system"
+                domain["seed"] = seed
+                domain["provenance"] = chunk.provenance()
+            elif source == "tsotchke-local":
+                from .providers.tsotchke import read_tsotchke_entropy
+
+                chunk = read_tsotchke_entropy(16)
+                domain["source"] = "tsotchke-local"
+                domain["seed"] = int.from_bytes(chunk.data, "big")
+                domain["provenance"] = chunk.provenance()
+
+
+def _rng_patch_public(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    result = copy.deepcopy(value)
+    for name in ("decision", "sound"):
+        domain = result.get(name)
+        if isinstance(domain, dict) and isinstance(domain.get("seed"), int):
+            domain["seed"] = random_seed_public(domain["seed"])
+    return result
 
 
 @dataclass
@@ -257,16 +299,36 @@ class ChannelRuntime:
         self._seed_generators()
 
     def _seed_generators(self) -> None:
-        seed = self.config.random_seed
-        if seed is None:
-            seed = 0x50594245 + self.config.id
-        self.rng = random.Random(seed)
-        self.numpy_rng = _np.random.default_rng(seed) if _np is not None else None
+        if self.config.rng is None:
+            seed = self.config.random_seed
+            if seed is None:
+                seed = 0x50594245 + self.config.id
+            self.rng = random.Random(seed)
+            self.numpy_rng = _np.random.default_rng(seed) if _np is not None else None
+            self.decision_rng = self.rng
+            self.sound_rng = self.rng
+            self.sound_numpy_rng = self.numpy_rng if self.numpy_rng is not None else self.rng
+            return
+
+        def make(domain_name: str):
+            domain = getattr(self.config.rng, domain_name)
+            seed = domain.seed
+            if seed is None:
+                seed = derive_seed(self.config.id, domain_name)
+            return build_stream(domain.algorithm, seed, off=domain.mode == "off")
+
+        self.decision_rng = make("decision")
+        self.sound_rng = make("sound")
+        self.sound_numpy_rng = self.sound_rng
+        # Retain aliases for diagnostics and third-party code that inspected the
+        # old runtime object, while all v2 rendering uses explicit domains.
+        self.rng = self.decision_rng
+        self.numpy_rng = self.sound_numpy_rng
 
     def apply(self, candidate: Channel, patch: dict[str, Any], fade_frames: int, beat: float, frame: int) -> None:
         restart_pattern = any(key in patch for key in ("pattern", "step_beats", "clock", "bpm", "active"))
         self.config = candidate
-        if "random_seed" in patch:
+        if "random_seed" in patch or "rng" in patch:
             self._seed_generators()
         self.gain.set(0.0 if candidate.muted or not candidate.active else candidate.volume, fade_frames)
         self.pan.set(candidate.pan, fade_frames)
@@ -327,7 +389,7 @@ class ChannelRuntime:
         guard = 0
         while self.config.pattern and self.next_step_beat is not None and self.next_step_beat <= beat + EPSILON:
             step = self.config.pattern[self.step_index]
-            if not self.config.muted and step.notes and self.rng.random() <= step.probability:
+            if not self.config.muted and step.notes and self.decision_rng.random() <= step.probability:
                 self._trigger(step, bpm)
                 self.last_trigger_beat = self.next_step_beat
                 self.last_trigger_frame = frame
@@ -344,7 +406,7 @@ class ChannelRuntime:
         step_frames = max(1, round(self.config.step_beats * 60.0 / self.config.bpm * self.sample_rate))
         while self.config.pattern and self.next_step_frame is not None and self.next_step_frame <= frame:
             step = self.config.pattern[self.step_index]
-            if not self.config.muted and step.notes and self.rng.random() <= step.probability:
+            if not self.config.muted and step.notes and self.decision_rng.random() <= step.probability:
                 self._trigger(step, self.config.bpm)
                 self.last_trigger_frame = self.next_step_frame
                 self.last_trigger_beat = self.local_beat(self.next_step_frame, 0.0)
@@ -424,7 +486,7 @@ class ChannelRuntime:
         for frame in range(frames):
             dry = 0.0
             for voice in voices:
-                dry += voice.next_sample(self.rng)
+                dry += voice.next_sample(self.sound_rng)
 
             lfo = self._next_lfo() if modulation.target != "off" and modulation.depth else 0.0
 
@@ -516,7 +578,7 @@ class ChannelRuntime:
         voices = self.voices
         for voice in voices:
             if voice.alive:
-                dry += voice.render_numpy(count, self.numpy_rng)
+                dry += voice.render_numpy(count, self.sound_numpy_rng)
         self.voices = [voice for voice in voices if voice.alive]
 
         if effects.drive:
@@ -649,6 +711,8 @@ def _decision_summary(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         for key in ("name", "active", "muted", "clock", "bpm", "volume", "pan", "step_beats", "random_seed"):
             if key in patch:
                 summary[key] = random_seed_public(patch[key]) if key == "random_seed" else patch[key]
+        if "rng" in patch:
+            summary["rng"] = _rng_patch_public(patch["rng"])
         if "pattern" in patch:
             pattern = patch["pattern"]
             summary["pattern_steps"] = len(pattern)
@@ -836,6 +900,7 @@ class SynthEngine:
                 normalized["patch"] = {"active": True, "muted": False}
             patch = dict(normalized.get("patch", {}))
             _resolve_random_seed_patch(patch)
+            _resolve_rng_patch(patch)
             candidate = copy.deepcopy(self.channels[channel - 1].config)
             candidate.update(patch)
             normalized["patch"] = patch
@@ -854,6 +919,7 @@ class SynthEngine:
                 seen.add(channel)
                 patch = dict(raw.get("patch", {}))
                 _resolve_random_seed_patch(patch)
+                _resolve_rng_patch(patch)
                 candidate = copy.deepcopy(self.channels[channel - 1].config)
                 candidate.update(patch)
                 items.append({"channel": channel, "patch": patch})
@@ -1120,6 +1186,7 @@ class SynthEngine:
                         "bpm": config.bpm,
                         "step_beats": config.step_beats,
                         "random_seed": random_seed_public(config.random_seed),
+                        "rng": None if config.rng is None else config.rng.public(),
                         "loop_steps": len(config.pattern),
                         "loop_seconds": round(len(config.pattern) * config.step_beats * 60.0 / config.bpm, 6),
                         "waveform": config.synth.waveform,

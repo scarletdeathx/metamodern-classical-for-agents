@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 MAX_CHANNELS = 10
 MAX_RANDOM_SEED = (1 << 128) - 1
+RNG_MODES = {"derived", "seeded", "fresh", "off"}
 WAVEFORMS = {"sine", "triangle", "saw", "square", "noise"}
 FILTER_TYPES = {"off", "lowpass", "highpass", "bandpass"}
 CLOCK_MODES = {"free", "sync"}
@@ -23,6 +24,91 @@ _PITCH_CLASS = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 
 class ValidationError(ValueError):
     """An invalid musical or command value."""
+
+
+@dataclass
+class RNGDomain:
+    mode: str = "derived"
+    algorithm: str = "pcg64dxsm"
+    seed: int | None = None
+    source: str | None = None
+    provenance: dict[str, Any] | None = None
+
+    def update(self, patch: dict[str, Any]) -> None:
+        from .rng import ALGORITHMS
+
+        unknown = set(patch) - {"mode", "algorithm", "seed", "source", "provenance"}
+        if unknown:
+            raise ValidationError(f"unknown RNG domain fields: {', '.join(sorted(unknown))}")
+        previous_mode = self.mode
+        if "mode" in patch:
+            self.mode = str(patch["mode"]).strip().lower()
+        if "algorithm" in patch:
+            self.algorithm = str(patch["algorithm"]).strip().lower()
+        if "seed" in patch:
+            self.seed = validate_random_seed(patch["seed"])
+        if "source" in patch:
+            self.source = None if patch["source"] is None else str(patch["source"]).strip().lower()
+        elif self.mode != previous_mode:
+            self.source = "system" if self.mode == "fresh" else None
+        if "seed" not in patch and self.mode != previous_mode and self.mode in {"derived", "off"}:
+            self.seed = None
+        if "provenance" in patch:
+            if patch["provenance"] is not None and not isinstance(patch["provenance"], dict):
+                raise ValidationError("RNG provenance must be an object")
+            self.provenance = None if patch["provenance"] is None else dict(patch["provenance"])
+        elif self.mode != previous_mode:
+            self.provenance = None
+        if self.mode not in RNG_MODES:
+            raise ValidationError(f"RNG mode must be one of {sorted(RNG_MODES)}")
+        if self.algorithm not in ALGORITHMS:
+            raise ValidationError(f"RNG algorithm must be one of {sorted(ALGORITHMS)}")
+        if self.mode == "seeded" and self.seed is None:
+            raise ValidationError("seeded RNG mode requires a seed")
+        if self.mode == "fresh":
+            if self.source not in {"system", "tsotchke-local"}:
+                raise ValidationError("fresh RNG source must be 'system' or 'tsotchke-local'")
+            if self.seed is None:
+                raise ValidationError("fresh RNG entropy must be resolved by the engine control plane")
+        elif self.source is not None:
+            raise ValidationError("RNG source is only valid for fresh mode in this beta slice")
+        elif self.provenance is not None:
+            raise ValidationError("RNG provenance is only valid for fresh mode")
+        if self.mode in {"derived", "off"} and self.seed is not None:
+            raise ValidationError(f"{self.mode} RNG mode does not accept a seed")
+
+    def public(self) -> dict[str, Any]:
+        from .rng import FRIENDLY_ALGORITHM_NAMES, FRIENDLY_SOURCE_NAMES
+
+        return {
+            "mode": self.mode,
+            "algorithm": self.algorithm,
+            "label": FRIENDLY_ALGORITHM_NAMES[self.algorithm],
+            "seed": random_seed_public(self.seed),
+            "source": self.source,
+            "source_label": FRIENDLY_SOURCE_NAMES.get(self.source),
+            "provenance": self.provenance,
+        }
+
+
+@dataclass
+class LaneRNG:
+    decision: RNGDomain = field(default_factory=RNGDomain)
+    sound: RNGDomain = field(default_factory=RNGDomain)
+
+    def update(self, patch: dict[str, Any]) -> None:
+        unknown = set(patch) - {"decision", "sound"}
+        if unknown:
+            raise ValidationError(f"unknown RNG fields: {', '.join(sorted(unknown))}")
+        for domain in ("decision", "sound"):
+            if domain in patch:
+                value = patch[domain]
+                if not isinstance(value, dict):
+                    raise ValidationError(f"rng.{domain} must be an object")
+                getattr(self, domain).update(dict(value))
+
+    def public(self) -> dict[str, Any]:
+        return {"decision": self.decision.public(), "sound": self.sound.public()}
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -277,6 +363,7 @@ class Channel:
     pan: float = 0.0
     step_beats: float = 0.25
     random_seed: int | None = None
+    rng: LaneRNG | None = None
     pattern: list[Step] = field(default_factory=list)
     synth: Synth = field(default_factory=Synth)
 
@@ -291,6 +378,7 @@ class Channel:
             "pan",
             "step_beats",
             "random_seed",
+            "rng",
             "pattern",
             "synth",
         }
@@ -315,8 +403,19 @@ class Channel:
             self.pan = _bounded("pan", patch["pan"], -1.0, 1.0)
         if "step_beats" in patch:
             self.step_beats = _bounded("step_beats", patch["step_beats"], 1 / 64, 16.0)
+        if "random_seed" in patch and "rng" in patch:
+            raise ValidationError("use either legacy random_seed or v2 rng, not both")
         if "random_seed" in patch:
             self.random_seed = validate_random_seed(patch["random_seed"])
+            self.rng = None
+        if "rng" in patch:
+            value = patch["rng"]
+            if not isinstance(value, dict):
+                raise ValidationError("rng must be an object")
+            candidate = self.rng if self.rng is not None else LaneRNG()
+            candidate.update(dict(value))
+            self.rng = candidate
+            self.random_seed = None
         if "pattern" in patch:
             raw_pattern = patch["pattern"]
             if not isinstance(raw_pattern, list):
@@ -330,6 +429,7 @@ class Channel:
     def public(self) -> dict[str, Any]:
         data = asdict(self)
         data["random_seed"] = random_seed_public(self.random_seed)
+        data["rng"] = None if self.rng is None else self.rng.public()
         data["pattern"] = [step.public() for step in self.pattern]
         data["loop_steps"] = len(self.pattern)
         data["loop_beats"] = round(len(self.pattern) * self.step_beats, 6)
