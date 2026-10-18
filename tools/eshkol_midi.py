@@ -68,6 +68,8 @@ def generate_midi(
     bars: int,
     backend: str = DEFAULT_BACKEND,
     seed_tag: str = "",
+    rngoddess_sources: list[str] | None = None,
+    rngoddess: bool = False,
 ) -> tuple["mido.MidiFile", dict]:
     """Generate a multi-lane MIDI file from Eshkol draws."""
     import mido
@@ -78,7 +80,7 @@ def generate_midi(
 
     mid = mido.MidiFile(ticks_per_beat=TICKS_PER_BEAT)
     provenance = {
-        "backend": backend,
+        "backend": "rngoddess" if rngoddess else backend,
         "lanes": lanes,
         "bars": bars,
         "seed_tag": seed_tag,
@@ -87,13 +89,22 @@ def generate_midi(
 
     for lane_id in range(lanes):
         # Independent domain per lane: separate drawd call per lane
-        data = draw_from_drawd(bytes_per_lane, backend=backend)
+        if rngoddess:
+            from mcfa.providers.mixer import RNGoddessMixer
+
+            mixer = RNGoddessMixer(rngoddess_sources,
+                                   label=f"mcfa/v2/rngoddess/midi/lane/{lane_id:02d}")
+            data = mixer.read(bytes_per_lane).data
+            entry = {"provider": "rngoddess", "manifest": mixer.provenance()}
+        else:
+            data = draw_from_drawd(bytes_per_lane, backend=backend)
+            entry = {"provider": f"eshkol-{backend}"}
         draw_hash = hashlib.sha256(data).hexdigest()
         provenance["draws"].append({
             "lane": lane_id,
             "bytes": len(data),
             "sha256": draw_hash,
-            "provider": f"eshkol-{backend}",
+            **entry,
         })
 
         notes = bytes_to_notes(data, lane_id)
@@ -136,6 +147,11 @@ def main(argv=None) -> int:
     ap.add_argument("--output", type=str, required=True, help="output .mid path")
     ap.add_argument("--backend", type=str, default=DEFAULT_BACKEND,
                     help="drawd backend name")
+    ap.add_argument("--rngoddess", action="store_true",
+                    help="mix contributors with RNGoddess (default contributor eshkol-local:moonlab)")
+    ap.add_argument("--source", dest="sources", action="append",
+                    help="RNGoddess contributor, repeatable (system, tsotchke-local, "
+                         "eshkol-local:<backend>; trailing ? = optional)")
     ap.add_argument("--tag", type=str, default="", help="seed tag for provenance")
     args = ap.parse_args(argv)
 
@@ -152,11 +168,17 @@ def main(argv=None) -> int:
         print("mido is required: pip install mido", file=sys.stderr)
         return 1
 
-    print(f"Drawing Eshkol entropy (backend={args.backend}) for "
+    if args.sources and not args.rngoddess:
+        print("--source requires --rngoddess", file=sys.stderr)
+        return 1
+    what = "RNGoddess mix" if args.rngoddess else f"Eshkol entropy (backend={args.backend})"
+    print(f"Drawing {what} for "
           f"{args.lanes} lanes x {args.bars} bars...", flush=True)
     try:
         mid, provenance = generate_midi(args.lanes, args.bars,
-                                        backend=args.backend, seed_tag=args.tag)
+                                        backend=args.backend, seed_tag=args.tag,
+                                        rngoddess=args.rngoddess,
+                                        rngoddess_sources=args.sources)
     except Exception as exc:
         print(f"draw failed: {exc}", file=sys.stderr)
         return 1

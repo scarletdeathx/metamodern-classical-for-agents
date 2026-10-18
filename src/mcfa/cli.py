@@ -610,10 +610,11 @@ def command_schema(_args: argparse.Namespace) -> int:
                     for algorithm in sorted(ALGORITHMS)
                 ],
                 "domain": {
-                    "mode": "derived, seeded, fresh (one control-plane seed), or off",
+                    "mode": "derived, seeded, fresh (one control-plane seed), mixed (RNGoddess), or off",
                     "algorithm": "canonical algorithm id",
                     "seed": "integer/0x hex; required for seeded, resolved by engine for fresh",
-                    "source": "system, tsotchke-local, or eshkol-local for fresh mode",
+                    "source": "system, tsotchke-local, or eshkol-local[:backend] for fresh mode; mixed for mixed mode",
+                    "sources": "mixed mode contributors (default [\"eshkol-local:moonlab\"]); trailing ? marks optional",
                 },
             },
             "pattern": "list of steps",

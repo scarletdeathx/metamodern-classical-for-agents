@@ -74,13 +74,23 @@ def _resolve_rng_patch(patch: dict[str, Any]) -> None:
                 domain["source"] = "tsotchke-local"
                 domain["seed"] = int.from_bytes(chunk.data, "big")
                 domain["provenance"] = chunk.provenance()
-            elif source == "eshkol-local":
-                from .providers.eshkol import read_eshkol_entropy
+            elif source == "eshkol-local" or source.startswith("eshkol-local:"):
+                from .providers.eshkol import DEFAULT_BACKEND, read_eshkol_entropy
 
-                chunk = read_eshkol_entropy(16)
-                domain["source"] = "eshkol-local"
+                backend = source.partition(":")[2] or DEFAULT_BACKEND
+                chunk = read_eshkol_entropy(16, backend=backend)
+                domain["source"] = source
                 domain["seed"] = int.from_bytes(chunk.data, "big")
                 domain["provenance"] = chunk.provenance()
+        elif str(domain.get("mode", "")).strip().lower() == "mixed" and "seed" not in domain:
+            from .providers.mixer import RNGoddessMixer
+
+            mixer = RNGoddessMixer(domain.get("sources"), label=f"mcfa/v2/rngoddess/{name}")
+            chunk = mixer.read(16)
+            domain["source"] = "mixed"
+            domain["sources"] = mixer.sources
+            domain["seed"] = int.from_bytes(chunk.data, "big")
+            domain["provenance"] = {**chunk.provenance(), "manifest": mixer.provenance()}
 
 
 def _rng_patch_public(value: Any) -> Any:

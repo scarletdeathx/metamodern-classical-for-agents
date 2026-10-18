@@ -10,7 +10,7 @@ from typing import Any, Iterable
 
 MAX_CHANNELS = 10
 MAX_RANDOM_SEED = (1 << 128) - 1
-RNG_MODES = {"derived", "seeded", "fresh", "off"}
+RNG_MODES = {"derived", "seeded", "fresh", "mixed", "off"}
 WAVEFORMS = {"sine", "triangle", "saw", "square", "noise"}
 FILTER_TYPES = {"off", "lowpass", "highpass", "bandpass"}
 CLOCK_MODES = {"free", "sync"}
@@ -26,6 +26,13 @@ class ValidationError(ValueError):
     """An invalid musical or command value."""
 
 
+def _valid_fresh_source(source: str | None) -> bool:
+    if source in {"system", "tsotchke-local", "eshkol-local"}:
+        return True
+    base, sep, backend = (source or "").partition(":")
+    return base == "eshkol-local" and bool(sep) and bool(re.fullmatch(r"[a-z0-9_-]+", backend))
+
+
 @dataclass
 class RNGDomain:
     mode: str = "derived"
@@ -33,11 +40,12 @@ class RNGDomain:
     seed: int | None = None
     source: str | None = None
     provenance: dict[str, Any] | None = None
+    sources: list[str] | None = None
 
     def update(self, patch: dict[str, Any]) -> None:
         from .rng import ALGORITHMS
 
-        unknown = set(patch) - {"mode", "algorithm", "seed", "source", "provenance"}
+        unknown = set(patch) - {"mode", "algorithm", "seed", "source", "provenance", "sources"}
         if unknown:
             raise ValidationError(f"unknown RNG domain fields: {', '.join(sorted(unknown))}")
         previous_mode = self.mode
@@ -50,7 +58,21 @@ class RNGDomain:
         if "source" in patch:
             self.source = None if patch["source"] is None else str(patch["source"]).strip().lower()
         elif self.mode != previous_mode:
-            self.source = "system" if self.mode == "fresh" else None
+            self.source = {"fresh": "system", "mixed": "mixed"}.get(self.mode)
+        if "sources" in patch:
+            if patch["sources"] is None:
+                self.sources = None
+            elif isinstance(patch["sources"], (list, tuple)):
+                from .providers.mixer import normalize_sources
+
+                try:
+                    self.sources = normalize_sources(patch["sources"])
+                except ValueError as exc:
+                    raise ValidationError(str(exc)) from exc
+            else:
+                raise ValidationError("RNG sources must be a list of contributor names")
+        elif self.mode != previous_mode:
+            self.sources = None
         if "seed" not in patch and self.mode != previous_mode and self.mode in {"derived", "off"}:
             self.seed = None
         if "provenance" in patch:
@@ -66,14 +88,21 @@ class RNGDomain:
         if self.mode == "seeded" and self.seed is None:
             raise ValidationError("seeded RNG mode requires a seed")
         if self.mode == "fresh":
-            if self.source not in {"system", "tsotchke-local", "eshkol-local"}:
-                raise ValidationError("fresh RNG source must be 'system', 'tsotchke-local', or 'eshkol-local'")
+            if not _valid_fresh_source(self.source):
+                raise ValidationError("fresh RNG source must be 'system', 'tsotchke-local', or 'eshkol-local[:backend]'")
             if self.seed is None:
                 raise ValidationError("fresh RNG entropy must be resolved by the engine control plane")
+        elif self.mode == "mixed":
+            if self.source != "mixed":
+                raise ValidationError("mixed RNG mode uses source 'mixed'; list contributors in 'sources'")
+            if self.seed is None:
+                raise ValidationError("mixed RNG entropy must be resolved by the engine control plane")
         elif self.source is not None:
-            raise ValidationError("RNG source is only valid for fresh mode in this beta slice")
+            raise ValidationError("RNG source is only valid for fresh or mixed mode")
         elif self.provenance is not None:
-            raise ValidationError("RNG provenance is only valid for fresh mode")
+            raise ValidationError("RNG provenance is only valid for fresh or mixed mode")
+        if self.mode != "mixed" and self.sources is not None:
+            raise ValidationError("RNG sources are only valid for mixed mode")
         if self.mode in {"derived", "off"} and self.seed is not None:
             raise ValidationError(f"{self.mode} RNG mode does not accept a seed")
 
@@ -86,7 +115,8 @@ class RNGDomain:
             "label": FRIENDLY_ALGORITHM_NAMES[self.algorithm],
             "seed": random_seed_public(self.seed),
             "source": self.source,
-            "source_label": FRIENDLY_SOURCE_NAMES.get(self.source),
+            "source_label": FRIENDLY_SOURCE_NAMES.get((self.source or "").split(":")[0]),
+            "sources": self.sources,
             "provenance": self.provenance,
         }
 

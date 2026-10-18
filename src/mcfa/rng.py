@@ -29,6 +29,7 @@ FRIENDLY_ALGORITHM_NAMES = {
 FRIENDLY_SOURCE_NAMES = {
     "system": "Soft Reset",
     "tsotchke-local": "Decoherence Engine",
+    "mixed": "RNGoddess",
 }
 DEFAULT_ROOT_SEED = 0x4D4346415F56325F524E475F524F4F54
 
