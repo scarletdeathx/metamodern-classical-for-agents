@@ -70,6 +70,7 @@ def generate_midi(
     seed_tag: str = "",
     rngoddess_sources: list[str] | None = None,
     rngoddess: bool = False,
+    draw_fn=None,
 ) -> tuple["mido.MidiFile", dict]:
     """Generate a multi-lane MIDI file from Eshkol draws."""
     import mido
@@ -89,11 +90,14 @@ def generate_midi(
 
     for lane_id in range(lanes):
         # Independent domain per lane: separate drawd call per lane
-        if rngoddess:
+        if draw_fn is not None:
+            # Injected source: returns (bytes, provenance-entry dict).
+            data, entry = draw_fn(bytes_per_lane, lane_id)
+        elif rngoddess:
             from mcfa.providers.mixer import RNGoddessMixer
 
             mixer = RNGoddessMixer(rngoddess_sources,
-                                   label=f"mcfa/v2/rngoddess/midi/lane/{lane_id:02d}")
+                                   label=f"mcfa/v2/rngoddess/midi/{seed_tag + '/' if seed_tag else ''}lane/{lane_id:02d}")
             data = mixer.read(bytes_per_lane).data
             entry = {"provider": "rngoddess", "manifest": mixer.provenance()}
         else:
