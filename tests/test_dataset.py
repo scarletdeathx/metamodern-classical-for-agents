@@ -21,7 +21,7 @@ def fake_draw(n, lane, tag):
 
 
 def constant_draw(n, lane, tag):
-    return bytes(n), {"provider": "constant"}
+    return bytes([200]) * n, {"provider": "constant"}
 
 
 @unittest.skipIf(mido is None, "mido not installed")

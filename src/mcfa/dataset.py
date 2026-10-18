@@ -8,9 +8,10 @@ Layout under the output directory:
     rejects.jsonl        rejected attempts (malformed, empty, duplicate)
     dataset_card.md      generated from facts only
 
-Only the knobs eshkol_midi already has are used (lanes, bars). With
-vary=True they are chosen per piece from the entropy source itself and the
-draw is logged in the piece metadata. No musical content is added here.
+Musical controls come from mcfa.midi_controls (tempo, metre, key, scale,
+lane ranges, rests, velocity, lengths, programs). With vary=True, the fields
+named in a VarySpec are chosen per piece from the entropy source itself and
+every drawn value is logged in the piece metadata.
 """
 
 from __future__ import annotations
@@ -103,12 +104,13 @@ def default_draw_fn(rngoddess: bool, sources: list[str] | None, backend: str) ->
     return draw
 
 
-def _vary(draw: DrawFn, tag: str, lanes_range, bars_range) -> tuple[int, int, dict]:
+def _vary(draw: DrawFn, tag: str, base, spec, lanes: int, bars: int):
+    from .midi_controls import vary_controls
+
     data, entry = draw(32, -1, tag)
-    lanes = lanes_range[0] + data[0] % (lanes_range[1] - lanes_range[0] + 1)
-    bars = bars_range[0] + data[1] % (bars_range[1] - bars_range[0] + 1)
-    return lanes, bars, {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-                         "lanes_byte": data[0], "bars_byte": data[1], **entry}
+    controls, lanes, bars, drawn = vary_controls(base, spec, data, lanes, bars)
+    return controls, lanes, bars, {"drawn": drawn, "bytes": len(data),
+                                   "sha256": hashlib.sha256(data).hexdigest(), **entry}
 
 
 def generate_dataset(
@@ -118,8 +120,11 @@ def generate_dataset(
     lanes: int = 4,
     bars: int = 8,
     vary: bool = False,
-    lanes_range: tuple[int, int] = (1, 8),
-    bars_range: tuple[int, int] = (4, 16),
+    lanes_range: tuple[int, int] | None = (1, 8),
+    bars_range: tuple[int, int] | None = (4, 16),
+    controls=None,
+    vary_spec=None,
+    legacy: bool = False,
     rngoddess: bool = True,
     sources: list[str] | None = None,
     backend: str = "moonlab",
@@ -128,7 +133,19 @@ def generate_dataset(
     draw_fn: DrawFn | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    from .midi_controls import MidiControls, VarySpec
+
     tool = _load_tool()
+    if legacy and vary_spec is not None and any(
+            getattr(vary_spec, f) for f in ("tempo_range", "scales", "keys", "time_signatures", "rest_range")):
+        raise ValueError("legacy mode cannot vary musical controls")
+    base_controls = None if legacy else (controls or MidiControls()).validate()
+    if vary:
+        vary_spec = vary_spec or VarySpec()
+        if vary_spec.lanes_range is None:
+            vary_spec.lanes_range = lanes_range
+        if vary_spec.bars_range is None:
+            vary_spec.bars_range = bars_range
     out = Path(out_dir)
     (out / "midi").mkdir(parents=True, exist_ok=True)
     (out / "meta").mkdir(parents=True, exist_ok=True)
@@ -156,12 +173,24 @@ def generate_dataset(
         t0 = time.monotonic()
         for attempt in range(1, MAX_ATTEMPTS + 1):
             tag = f"{seed_label}-{pid}" + (f"-r{attempt}" if attempt > 1 else "")
-            params: dict[str, Any] = {"lanes": lanes, "bars": bars, "vary": vary}
+            params: dict[str, Any] = {"lanes": lanes, "bars": bars, "vary": vary, "legacy": legacy}
+            piece_controls = base_controls
             if vary:
-                params["lanes"], params["bars"], params["vary_draw"] = _vary(draw, tag, lanes_range, bars_range)
-                params["lanes_range"], params["bars_range"] = list(lanes_range), list(bars_range)
+                if legacy:
+                    from .midi_controls import vary_controls  # lanes/bars only
+                    data0, entry0 = draw(32, -1, tag)
+                    _, params["lanes"], params["bars"], drawn = vary_controls(
+                        MidiControls(), vary_spec, data0, lanes, bars)
+                    params["vary_draw"] = {"drawn": drawn, "bytes": len(data0),
+                                           "sha256": hashlib.sha256(data0).hexdigest(), **entry0}
+                else:
+                    piece_controls, params["lanes"], params["bars"], params["vary_draw"] = _vary(
+                        draw, tag, base_controls, vary_spec, lanes, bars)
+                params["vary_spec"] = {k: v for k, v in vars(vary_spec).items() if v}
+            params["controls"] = None if piece_controls is None else piece_controls.public()
             mid, prov = tool.generate_midi(params["lanes"], params["bars"], seed_tag=tag,
-                                           draw_fn=lambda n, lane: draw(n, lane, tag))
+                                           draw_fn=lambda n, lane: draw(n, lane, tag),
+                                           controls=piece_controls, legacy=legacy)
             buf = io.BytesIO()
             mid.save(file=buf)
             data = buf.getvalue()
@@ -189,6 +218,7 @@ def generate_dataset(
             "params": params, "source": source_desc,
             "midi": f"midi/{pid}.mid", "midi_sha256": sha, "midi_bytes": len(data), **stats,
             "lanes_provenance": prov["draws"],
+            "lane_layout": prov.get("lane_layout", []),
             "generator": {"tool": "tools/eshkol_midi.py", "commit": git_commit()},
             "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         }
@@ -221,6 +251,26 @@ def finalize(out: Path) -> dict[str, Any]:
     rejects = out / "rejects.jsonl"
     nrej = len(rejects.read_text().splitlines()) if rejects.exists() else 0
     total = sum(m["midi_bytes"] for m in metas)
+    ctl = [m["params"].get("controls") for m in metas if m["params"].get("controls")]
+
+    def counts(key):
+        c: dict[str, int] = {}
+        for x in ctl:
+            c[str(x[key])] = c.get(str(x[key]), 0) + 1
+        return ", ".join(f"{k} ({v})" for k, v in sorted(c.items())) or "-"
+    tempos = [x["tempo"] for x in ctl]
+    controls_md = "" if not ctl else f"""
+## Musical controls
+
+- Tempo (BPM): {min(tempos)} - {max(tempos)}
+- Scales: {counts('scale')}
+- Keys: {counts('key')}
+- Time signatures: {counts('time_signature')}
+- Rest probability: {min(x['rest_probability'] for x in ctl)} - {max(x['rest_probability'] for x in ctl)}
+- Velocity ranges: {counts('velocity')}
+- Note lengths (beats): {counts('lengths')}
+"""
+    legacy_n = sum(1 for m in metas if m["params"].get("legacy"))
     card = f"""# MCFA MIDI dataset
 
 - Generated: {_dt.date.today().isoformat()}
@@ -242,6 +292,7 @@ def finalize(out: Path) -> dict[str, Any]:
 | duration (s) | {rng('duration_s')[0]} | {rng('duration_s')[1]} |
 | tracks | {rng('tracks')[0]} | {rng('tracks')[1]} |
 
+{controls_md}{f"Legacy (C1-C8 chromatic) pieces: {legacy_n}" + chr(10) if legacy_n else ""}
 Files: `midi/NNNNNN.mid`, `meta/NNNNNN.json`, `manifest.jsonl`{', `rejects.jsonl`' if nrej else ''}.
 """
     atomic_write(out / "dataset_card.md", card.encode())

@@ -10,7 +10,10 @@ Output is a standard .mid file (via mido) plus a JSON sidecar with
 provenance for every draw used.
 
 Usage:
-    python3 eshkol_midi.py --lanes 4 --bars 8 --output training_001.mid --backend synthetic
+    python3 eshkol_midi.py --lanes 4 --bars 8 --output out.mid                 # A aeolian, 120 BPM, 4/4
+    python3 eshkol_midi.py --tempo 90 --key D --scale dorian --time-signature 7/8 --output out.mid
+    python3 eshkol_midi.py --rngoddess --lane-range C2-C4 --lane-range G3-G5 --program 33 --program 0 --output out.mid
+    python3 eshkol_midi.py --legacy --backend synthetic --output old.mid       # original C1-C8 chromatic mapping
 
 Requires: mido, drawd running locally (127.0.0.1:18751 or /tmp/eshkol-drawd.sock)
 """
@@ -26,6 +29,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mcfa.providers.eshkol import draw_from_drawd, DEFAULT_BACKEND  # noqa: E402
+from mcfa.midi_controls import (  # noqa: E402
+    KEYS, SCALES, SCALE_ALIASES, MidiControls, bytes_needed, lane_notes, midi_channel,
+    parse_range,
+)
 
 
 # MIDI mapping constants
@@ -63,6 +70,24 @@ def bytes_to_notes(data: bytes, lane_id: int) -> list[dict]:
     return notes
 
 
+def _emit_track(track, notes, channel, mido, end_tick=None) -> None:
+    events = []
+    for n in notes:
+        events.append((n["start_tick"], 1, "on", n))
+        events.append((n["start_tick"] + n["duration_ticks"], 0, "off", n))
+    events.sort(key=lambda e: (e[0], e[1]))
+    last_tick = 0
+    for tick, _, kind, n in events:
+        track.append(mido.Message(
+            "note_on" if kind == "on" else "note_off", note=n["pitch"],
+            velocity=n["velocity"] if kind == "on" else 0, time=tick - last_tick, channel=channel,
+        ))
+        last_tick = tick
+    if end_tick is not None and end_tick >= last_tick:
+        # pad trailing rests so every lane spans exactly the requested bars
+        track.append(mido.MetaMessage("end_of_track", time=end_tick - last_tick))
+
+
 def generate_midi(
     lanes: int,
     bars: int,
@@ -71,13 +96,23 @@ def generate_midi(
     rngoddess_sources: list[str] | None = None,
     rngoddess: bool = False,
     draw_fn=None,
+    controls: MidiControls | None = None,
+    legacy: bool = False,
 ) -> tuple["mido.MidiFile", dict]:
-    """Generate a multi-lane MIDI file from Eshkol draws."""
+    """Generate a multi-lane MIDI file from Eshkol draws.
+
+    Default: musically constrained output from ``controls`` (MidiControls()).
+    ``legacy=True`` reproduces the original C1-C8 chromatic byte mapping.
+    """
     import mido
 
-    total_beats = bars * BEATS_PER_BAR
-    # Estimate: ~4 notes per beat per lane, 4 bytes per note
-    bytes_per_lane = total_beats * 4 * 4
+    if not legacy:
+        controls = (controls or MidiControls()).validate()
+        bytes_per_lane = bytes_needed(controls, bars)
+    else:
+        bytes_per_lane = bars * BEATS_PER_BAR * 4 * 4
+    total_ticks = (round(bars * controls.beats_per_bar * TICKS_PER_BEAT) if not legacy
+                   else bars * BEATS_PER_BAR * TICKS_PER_BEAT)
 
     mid = mido.MidiFile(ticks_per_beat=TICKS_PER_BEAT)
     provenance = {
@@ -85,13 +120,14 @@ def generate_midi(
         "lanes": lanes,
         "bars": bars,
         "seed_tag": seed_tag,
+        "legacy": legacy,
+        "controls": None if legacy else controls.public(),
+        "lane_layout": [],
         "draws": [],
     }
 
     for lane_id in range(lanes):
-        # Independent domain per lane: separate drawd call per lane
         if draw_fn is not None:
-            # Injected source: returns (bytes, provenance-entry dict).
             data, entry = draw_fn(bytes_per_lane, lane_id)
         elif rngoddess:
             from mcfa.providers.mixer import RNGoddessMixer
@@ -103,45 +139,78 @@ def generate_midi(
         else:
             data = draw_from_drawd(bytes_per_lane, backend=backend)
             entry = {"provider": f"eshkol-{backend}"}
-        draw_hash = hashlib.sha256(data).hexdigest()
         provenance["draws"].append({
-            "lane": lane_id,
-            "bytes": len(data),
-            "sha256": draw_hash,
-            **entry,
+            "lane": lane_id, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), **entry,
         })
 
-        notes = bytes_to_notes(data, lane_id)
         track = mido.MidiTrack()
         track.name = f"eshkol-lane-{lane_id:02d}"
         mid.tracks.append(track)
-
-        # Sort by start tick and emit note_on/note_off with deltas
-        events = []
-        for n in notes:
-            # Stop at the bar boundary
-            if n["start_tick"] >= total_beats * TICKS_PER_BEAT:
-                break
-            events.append((n["start_tick"], "on", n))
-            events.append((n["start_tick"] + n["duration_ticks"], "off", n))
-        events.sort(key=lambda e: (e[0], 0 if e[1] == "off" else 1))
-
-        last_tick = 0
-        for tick, kind, n in events:
-            delta = tick - last_tick
-            if kind == "on":
-                track.append(mido.Message(
-                    "note_on", note=n["pitch"], velocity=n["velocity"],
-                    time=delta, channel=lane_id % 16,
-                ))
-            else:
-                track.append(mido.Message(
-                    "note_off", note=n["pitch"], velocity=0,
-                    time=delta, channel=n["lane"] % 16,
-                ))
-            last_tick = tick
+        if legacy:
+            channel = lane_id % 16
+            # original behaviour: stop at the first note starting past the end
+            out = []
+            for n in bytes_to_notes(data, lane_id):
+                if n["start_tick"] >= total_ticks:
+                    break
+                out.append(n)
+            notes = out
+        else:
+            channel = midi_channel(lane_id)
+            if lane_id == 0:
+                num, den = (int(x) for x in controls.time_signature.split("/"))
+                track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(controls.tempo), time=0))
+                track.append(mido.MetaMessage("time_signature", numerator=num, denominator=den, time=0))
+            program = controls.program(lane_id)
+            if program is not None:
+                track.append(mido.Message("program_change", program=program, channel=channel, time=0))
+            notes = lane_notes(data, lane_id, bars, controls)
+            lo, hi = controls.lane_range(lane_id)
+            provenance["lane_layout"].append({
+                "lane": lane_id, "role": controls.role(lane_id), "range": [lo, hi],
+                "channel": channel, "program": program, "notes": len(notes),
+            })
+        _emit_track(track, notes, channel, mido, end_tick=None if legacy else total_ticks)
 
     return mid, provenance
+
+
+def _floats(text: str) -> tuple[float, ...]:
+    return tuple(float(x) for x in text.split(",") if x.strip())
+
+
+def _pair(text: str, cast=int):
+    lo, _, hi = text.partition("-")
+    return cast(lo), cast(hi or lo)
+
+
+def add_control_args(ap: argparse.ArgumentParser) -> None:
+    """Shared musical-control flags (also used by tools/mcfa_dataset.py)."""
+    g = ap.add_argument_group("musical controls")
+    g.add_argument("--tempo", type=float, default=120.0, help="BPM (20..400), written as set_tempo")
+    g.add_argument("--time-signature", default="4/4", help="e.g. 4/4, 3/4, 7/8")
+    g.add_argument("--key", default="A", help="root: C, C#, Db ... B (default A)")
+    g.add_argument("--scale", default="aeolian",
+                   help="one of " + ", ".join(sorted(SCALES) + sorted(SCALE_ALIASES)))
+    g.add_argument("--rest-probability", type=float, default=0.15)
+    g.add_argument("--velocity-range", default="40-110", help="MIDI velocity LOW-HIGH")
+    g.add_argument("--lengths", default="0.25,0.5,1,2", help="note lengths in beats (comma list)")
+    g.add_argument("--lane-range", action="append", dest="lane_ranges",
+                   help="per-lane pitch range LOW-HIGH (C2-C4 or 36-60), repeatable, cycled; "
+                        "default bass/tenor/alto/soprano registers")
+    g.add_argument("--program", action="append", type=int, dest="programs",
+                   help="per-lane GM program 0..127, repeatable, cycled")
+    g.add_argument("--legacy", action="store_true", help="original C1-C8 chromatic mapping")
+
+
+def controls_from_args(args) -> MidiControls:
+    return MidiControls(
+        tempo=args.tempo, time_signature=args.time_signature, key=args.key, scale=args.scale,
+        rest_probability=args.rest_probability, velocity=_pair(args.velocity_range),
+        lengths=_floats(args.lengths),
+        lane_ranges=[parse_range(r) for r in args.lane_ranges] if args.lane_ranges else None,
+        programs=args.programs,
+    ).validate()
 
 
 def main(argv=None) -> int:
@@ -149,14 +218,14 @@ def main(argv=None) -> int:
     ap.add_argument("--lanes", type=int, default=4, help="number of independent lanes")
     ap.add_argument("--bars", type=int, default=8, help="bars per lane")
     ap.add_argument("--output", type=str, required=True, help="output .mid path")
-    ap.add_argument("--backend", type=str, default=DEFAULT_BACKEND,
-                    help="drawd backend name")
+    ap.add_argument("--backend", type=str, default=DEFAULT_BACKEND, help="drawd backend name")
     ap.add_argument("--rngoddess", action="store_true",
                     help="mix contributors with RNGoddess (default contributor eshkol-local:moonlab)")
     ap.add_argument("--source", dest="sources", action="append",
                     help="RNGoddess contributor, repeatable (system, tsotchke-local, "
                          "eshkol-local:<backend>; trailing ? = optional)")
     ap.add_argument("--tag", type=str, default="", help="seed tag for provenance")
+    add_control_args(ap)
     args = ap.parse_args(argv)
 
     if not 1 <= args.lanes <= 16:
@@ -165,24 +234,26 @@ def main(argv=None) -> int:
     if args.bars < 1:
         print("bars must be >= 1", file=sys.stderr)
         return 1
-
+    if args.sources and not args.rngoddess:
+        print("--source requires --rngoddess", file=sys.stderr)
+        return 1
     try:
         import mido  # noqa: F401
     except ImportError:
         print("mido is required: pip install mido", file=sys.stderr)
         return 1
-
-    if args.sources and not args.rngoddess:
-        print("--source requires --rngoddess", file=sys.stderr)
-        return 1
-    what = "RNGoddess mix" if args.rngoddess else f"Eshkol entropy (backend={args.backend})"
-    print(f"Drawing {what} for "
-          f"{args.lanes} lanes x {args.bars} bars...", flush=True)
     try:
-        mid, provenance = generate_midi(args.lanes, args.bars,
-                                        backend=args.backend, seed_tag=args.tag,
-                                        rngoddess=args.rngoddess,
-                                        rngoddess_sources=args.sources)
+        controls = None if args.legacy else controls_from_args(args)
+    except Exception as exc:
+        print(f"bad controls: {exc}", file=sys.stderr)
+        return 1
+
+    what = "RNGoddess mix" if args.rngoddess else f"Eshkol entropy (backend={args.backend})"
+    print(f"Drawing {what} for {args.lanes} lanes x {args.bars} bars...", flush=True)
+    try:
+        mid, provenance = generate_midi(args.lanes, args.bars, backend=args.backend, seed_tag=args.tag,
+                                        rngoddess=args.rngoddess, rngoddess_sources=args.sources,
+                                        controls=controls, legacy=args.legacy)
     except Exception as exc:
         print(f"draw failed: {exc}", file=sys.stderr)
         return 1
@@ -191,8 +262,6 @@ def main(argv=None) -> int:
     mid.save(str(out))
     sidecar = out.with_suffix(".json")
     sidecar.write_text(json.dumps(provenance, indent=2))
-
-    total_notes = sum(len(t) for t in mid.tracks)
     print(f"Wrote {out} ({len(mid.tracks)} tracks)")
     print(f"Provenance: {sidecar}")
     for d in provenance["draws"]:
