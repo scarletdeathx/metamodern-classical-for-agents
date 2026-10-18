@@ -152,6 +152,41 @@ class EntropyReservoir:
                 self._condition.notify_all()
             return result
 
+    def take_blocking(self, count: int, *, timeout: float = 10.0) -> bytes:
+        """Copy ``count`` bytes, waiting for the producer when the buffer is short.
+
+        For offline or non-real-time consumers only (never the audio callback).
+        Having to wait counts as one underflow. Raises EntropyProviderError if
+        the provider failed while the consumer was waiting, or on timeout;
+        bytes are never invented.
+        """
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= self.capacity:
+            raise ValueError("count must be between 0 and capacity")
+        self.start()
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            self._requested += count
+            if len(self._buffer) < count:
+                self._underflows += 1
+                self._missing += count - len(self._buffer)
+                failures_before = self._failures
+                while len(self._buffer) < count:
+                    if self._stop:
+                        raise EntropyProviderError("entropy reservoir closed while waiting")
+                    if self._failures != failures_before:
+                        raise EntropyProviderError(f"entropy provider failed: {self._last_error}")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise EntropyProviderError(f"entropy reservoir starved for {timeout:g}s")
+                    self._condition.notify_all()
+                    self._condition.wait(timeout=remaining)
+            result = bytes(self._buffer[:count])
+            del self._buffer[:count]
+            self._delivered += count
+            if len(self._buffer) <= self.low_watermark:
+                self._condition.notify_all()
+            return result
+
     def status(self) -> dict[str, Any]:
         with self._condition:
             return {
