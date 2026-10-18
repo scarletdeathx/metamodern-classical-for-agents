@@ -66,8 +66,8 @@ class RNGDomain:
         if self.mode == "seeded" and self.seed is None:
             raise ValidationError("seeded RNG mode requires a seed")
         if self.mode == "fresh":
-            if self.source not in {"system", "tsotchke-local"}:
-                raise ValidationError("fresh RNG source must be 'system' or 'tsotchke-local'")
+            if self.source not in {"system", "tsotchke-local", "eshkol-local"}:
+                raise ValidationError("fresh RNG source must be 'system', 'tsotchke-local', or 'eshkol-local'")
             if self.seed is None:
                 raise ValidationError("fresh RNG entropy must be resolved by the engine control plane")
         elif self.source is not None:

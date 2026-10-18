@@ -74,6 +74,13 @@ def _resolve_rng_patch(patch: dict[str, Any]) -> None:
                 domain["source"] = "tsotchke-local"
                 domain["seed"] = int.from_bytes(chunk.data, "big")
                 domain["provenance"] = chunk.provenance()
+            elif source == "eshkol-local":
+                from .providers.eshkol import read_eshkol_entropy
+
+                chunk = read_eshkol_entropy(16)
+                domain["source"] = "eshkol-local"
+                domain["seed"] = int.from_bytes(chunk.data, "big")
+                domain["provenance"] = chunk.provenance()
 
 
 def _rng_patch_public(value: Any) -> Any:

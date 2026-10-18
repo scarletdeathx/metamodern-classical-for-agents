@@ -613,7 +613,7 @@ def command_schema(_args: argparse.Namespace) -> int:
                     "mode": "derived, seeded, fresh (one control-plane seed), or off",
                     "algorithm": "canonical algorithm id",
                     "seed": "integer/0x hex; required for seeded, resolved by engine for fresh",
-                    "source": "system or tsotchke-local for fresh mode",
+                    "source": "system, tsotchke-local, or eshkol-local for fresh mode",
                 },
             },
             "pattern": "list of steps",
