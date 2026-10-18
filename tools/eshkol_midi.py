@@ -10,7 +10,6 @@ Output is a standard .mid file (via mido) plus a JSON sidecar with
 provenance for every draw used.
 
 Usage:
-    python3 eshkol_midi.py --lanes 4 --bars 8 --output training_001.mid            # moonlab (default)
     python3 eshkol_midi.py --lanes 4 --bars 8 --output training_001.mid --backend synthetic
 
 Requires: mido, drawd running locally (127.0.0.1:18751 or /tmp/eshkol-drawd.sock)
@@ -136,7 +135,7 @@ def main(argv=None) -> int:
     ap.add_argument("--bars", type=int, default=8, help="bars per lane")
     ap.add_argument("--output", type=str, required=True, help="output .mid path")
     ap.add_argument("--backend", type=str, default=DEFAULT_BACKEND,
-                    help="drawd backend name (default: moonlab, or $ESHKOL_DRAWD_BACKEND)")
+                    help="drawd backend name")
     ap.add_argument("--tag", type=str, default="", help="seed tag for provenance")
     args = ap.parse_args(argv)
 

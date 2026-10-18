@@ -14,7 +14,6 @@ is no silent fallback to SystemRandom.
 from __future__ import annotations
 
 import json
-import os
 import platform
 import socket
 import struct
@@ -27,9 +26,7 @@ MAX_READ_BYTES = 1 << 20
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18751
 DEFAULT_SOCKET = "/tmp/eshkol-drawd.sock"
-# moonlab is the default; override with ESHKOL_DRAWD_BACKEND (e.g. synthetic).
-# An unavailable backend raises; there is never a fallback to another backend.
-DEFAULT_BACKEND = os.environ.get("ESHKOL_DRAWD_BACKEND") or "moonlab"
+DEFAULT_BACKEND = "synthetic"
 _ERR_LEN = 0xFFFFFFFF
 
 
