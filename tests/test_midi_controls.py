@@ -125,30 +125,32 @@ class DatasetVaryTests(unittest.TestCase):
     def test_vary_logged_and_carded(self):
         d = Path(tempfile.mkdtemp())
         spec = VarySpec(tempo_range=(60, 140), scales=["dorian", "aeolian", "lydian"], keys=list(KEYS))
+        log = d.parent / (d.name + ".jsonl")
+        self.addCleanup(lambda: log.unlink(missing_ok=True))
+        self.addCleanup(lambda: Path(str(log) + ".summary.md").unlink(missing_ok=True))
         dataset.generate_dataset(d, 4, lanes=2, bars=2, vary=True, vary_spec=spec,
-                                 lanes_range=(2, 3), bars_range=(2, 2), draw_fn=fake_draw)
-        for p in sorted((d / "meta").glob("*.json")):
-            m = json.loads(p.read_text())
-            drawn = m["params"]["vary_draw"]["drawn"]
+                                 lanes_range=(2, 3), bars_range=(2, 2), draw_fn=fake_draw, log=log)
+        for m in [json.loads(line) for line in log.read_text().splitlines() if json.loads(line)["event"] == "piece"]:
+            drawn = m["params"]["vary"]["drawn"]
             self.assertTrue({"tempo", "scale", "key", "lanes", "bars"} <= set(drawn))
             ctl = m["params"]["controls"]
             self.assertEqual((ctl["tempo"], ctl["scale"], ctl["key"]), (drawn["tempo"], drawn["scale"], drawn["key"]))
-            mid = mido.MidiFile(d / m["midi"])
+            mid = mido.MidiFile(d / m["manifest"]["path"])
             classes = {(KEYS.index(ctl["key"]) + i) % 12 for i in SCALES[ctl["scale"]]}
             for ti, note, _, _ in notes_of(mid):
                 lo, hi = m["lane_layout"][ti]["range"]
                 self.assertIn(note % 12, classes)
                 self.assertTrue(lo <= note <= hi)
-        card = (d / "dataset_card.md").read_text()
+        card = Path(str(log) + ".summary.md").read_text()
         self.assertIn("## Musical controls", card)
         self.assertIn("Tempo (BPM)", card)
 
     def test_legacy_dataset(self):
         d = Path(tempfile.mkdtemp())
         dataset.generate_dataset(d, 2, lanes=2, bars=2, legacy=True, draw_fn=fake_draw)
-        m = json.loads((d / "meta" / "000000.json").read_text())
-        self.assertTrue(m["params"]["legacy"])
-        self.assertIsNone(m["params"]["controls"])
+        m = json.loads((d / "manifest.jsonl").read_text().splitlines()[0])
+        self.assertIsNone(m["key"])
+        self.assertIsNone(m["scale"])
 
 
 if __name__ == "__main__":

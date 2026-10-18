@@ -207,6 +207,44 @@ class VarySpec:
     lanes_range: tuple[int, int] | None = None
     bars_range: tuple[int, int] | None = None
 
+    velocity_choices: list[list[int]] | None = None
+    length_choices: list[list[float]] | None = None
+    lane_range_choices: list[list[list[int]]] | None = None
+    program_choices: list[list[int]] | None = None
+    tempo_changes_range: tuple[int, int] | None = None
+    tempo_jump_range: tuple[float, float] | None = None
+
+    def validate(self):
+        import math
+        bounds = {"tempo_range": (20, 400), "rest_range": (0, 0.999),
+                  "lanes_range": (1, 16), "bars_range": (1, 100000),
+                  "tempo_changes_range": (0, 1024), "tempo_jump_range": (0, 380)}
+        for name, (minimum, maximum) in bounds.items():
+            value = getattr(self, name)
+            if value is not None:
+                if len(value) != 2 or not all(math.isfinite(x) for x in value) or not minimum <= value[0] <= value[1] <= maximum:
+                    raise ValidationError(f"invalid {name}: {value}")
+                if name in ("lanes_range", "bars_range", "tempo_changes_range") and any(type(x) is not int for x in value):
+                    raise ValidationError(f"{name} requires integers")
+        for name in ("scales", "keys", "time_signatures", "velocity_choices", "length_choices",
+                     "lane_range_choices", "program_choices"):
+            values = getattr(self, name)
+            if values is not None and not values:
+                raise ValidationError(f"{name} must not be empty")
+        for x in self.scales or []:
+            canonical_scale(x)
+        for x in self.keys or []:
+            canonical_key(x)
+        for x in self.time_signatures or []:
+            parse_time_signature(x)
+        for name, field_name in (("velocity_choices", "velocity"), ("length_choices", "lengths"),
+                                 ("lane_range_choices", "lane_ranges"), ("program_choices", "programs")):
+            for value in getattr(self, name) or []:
+                if not value:
+                    raise ValidationError(f"empty option in {name}")
+                MidiControls(scale="chromatic", **{field_name: value}).validate()
+        return self
+
     def bytes_needed(self) -> int:
         return 16
 
@@ -219,6 +257,7 @@ def vary_controls(base: MidiControls, spec: VarySpec, data: bytes, lanes: int, b
     """Choose per-piece values from entropy bytes; returns (controls, lanes, bars, drawn)."""
     if len(data) < 16:
         raise ValidationError("vary needs 16 entropy bytes")
+    spec.validate()
     c = MidiControls(**{**asdict(base)})
     drawn: dict[str, Any] = {}
     if spec.tempo_range:
@@ -241,6 +280,21 @@ def vary_controls(base: MidiControls, spec: VarySpec, data: bytes, lanes: int, b
     if spec.bars_range:
         lo, hi = spec.bars_range
         bars = lo + data[7] % (hi - lo + 1); drawn["bars"] = bars
+    for offset, spec_field, field_name in (
+        (8, "velocity_choices", "velocity"), (9, "length_choices", "lengths"),
+        (10, "lane_range_choices", "lane_ranges"), (11, "program_choices", "programs"),
+    ):
+        choices = getattr(spec, spec_field)
+        if choices:
+            value = _pick(choices, data[offset])
+            setattr(c, field_name, value)
+            drawn[field_name] = value
+    if spec.tempo_changes_range:
+        lo, hi = spec.tempo_changes_range
+        drawn["tempo_changes"] = lo + data[12] % (hi - lo + 1)
+    if spec.tempo_jump_range:
+        lo, hi = spec.tempo_jump_range
+        drawn["tempo_max_jump"] = lo + (hi - lo) * int.from_bytes(data[13:15], "big") / 65535
     return c.validate(), lanes, bars, drawn
 
 

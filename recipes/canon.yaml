@@ -1,0 +1,61 @@
+# Controls use MidiControls field names; vary uses VarySpec fields.
+# N tempo_changes means N additional events after the initial tempo at bar 0.
+recipes:
+  - name: control
+    count: 10
+    fixed: {tempo: 120, key: C, scale: aeolian, lanes: 4, bars: 8}
+  - name: static-tempo-varied-scale
+    count: 10
+    fixed: {tempo: 120, key: C, lanes: 4, bars: 8}
+    vary: {scales: all}
+  - name: wide-tempo
+    count: 10
+    fixed: {key: C, scale: aeolian, lanes: 4, bars: 8}
+    vary: {tempo_range: [40, 220]}
+  - name: tempo-automation
+    count: 10
+    fixed: {tempo: 120, tempo_changes: 4, tempo_change_range: [40, 220], tempo_max_jump: 80, lanes: 4, bars: 12}
+  - name: odd-meters
+    count: 10
+    fixed: {tempo: 120, lanes: 4, bars: 8}
+    vary: {time_signatures: [5/4, 7/8]}
+  - name: sparse
+    count: 10
+    fixed: {tempo: 120, rest_probability: 0.85, lanes: 4, bars: 8}
+  - name: dense
+    count: 10
+    fixed: {tempo: 120, rest_probability: 0.01, lanes: 4, bars: 8}
+  - name: narrow-clustered
+    count: 10
+    fixed:
+      tempo: 120
+      lanes: 4
+      bars: 8
+      lane_ranges: [[60, 64], [61, 65], [62, 66], [63, 67]]
+  - name: wide-registers
+    count: 10
+    fixed:
+      tempo: 120
+      lanes: 4
+      bars: 8
+      lane_ranges: [[24, 47], [48, 67], [60, 84], [96, 119]]
+  - name: everything-varied
+    count: 10
+    fixed: {tempo_change_range: [40, 220]}
+    vary:
+      tempo_range: [40, 220]
+      tempo_changes_range: [1, 5]
+      tempo_jump_range: [20, 180]
+      scales: all
+      keys: all
+      time_signatures: all
+      rest_range: [0.01, 0.85]
+      velocity_choices: [[1, 64], [40, 110], [64, 127], [1, 127]]
+      length_choices: [[0.125, 0.25], [0.25, 0.5, 1, 2], [0.3333333333, 0.6666666667], [1, 2, 4]]
+      lane_range_choices:
+        - [[36, 60], [48, 67], [55, 74], [60, 84]]
+        - [[24, 47], [48, 67], [60, 84], [96, 119]]
+        - [[54, 65], [55, 66], [56, 67], [57, 68]]
+      program_choices: [[0, 11, 33, 89], [8, 16, 24, 32], [40, 48, 56, 64], [72, 80, 96, 127]]
+      lanes_range: [2, 8]
+      bars_range: [8, 16]

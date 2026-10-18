@@ -1,0 +1,22 @@
+recipes:
+  - name: chaos-60s
+    count: 100
+    fixed: {duration: 60, tempo_change_range: [40, 220]}
+    vary:
+      tempo_range: [40, 220]
+      tempo_changes_range: [1, 8]
+      tempo_jump_range: [10, 180]
+      scales: all
+      keys: all
+      time_signatures: all
+      rest_range: [0.01, 0.9]
+      velocity_choices: [[1, 127], [1, 48], [32, 96], [64, 127]]
+      length_choices: [[0.0625, 0.125, 0.25], [0.25, 0.5, 1, 2], [0.3333333333, 0.6666666667], [0.5, 1, 2, 4]]
+      lane_range_choices:
+        - [[24, 47], [48, 67], [60, 84], [96, 119]]
+        - [[36, 60], [48, 67], [55, 74], [60, 84]]
+        - [[54, 65], [55, 66], [56, 67], [57, 68]]
+        - [[12, 127], [24, 96], [36, 108], [48, 119]]
+      # All GM programs are eligible for the per-piece program choice.
+      program_choices: all
+      lanes_range: [1, 8]

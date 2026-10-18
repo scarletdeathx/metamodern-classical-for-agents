@@ -224,3 +224,66 @@ also requires a one-minute actively conducted CoreAudio set through
 deadline stop, and no sustained underruns.
 
 Operational instructions for future Codex tasks are in [AGENTS.md](AGENTS.md).
+
+## Silent MIDI datasets
+
+Install optional file-generation dependencies in the existing environment:
+
+```bash
+.venv/bin/python -m pip install -e '.[dataset]'
+.venv/bin/python tools/mcfa_dataset.py --recipes recipes/canon.yaml --out /tmp/mcfa-canon
+.venv/bin/python tools/mcfa_dataset.py --recipes recipes/chaos-60s.yaml --out /tmp/mcfa-chaos60
+.venv/bin/python tools/verify_dataset.py /tmp/mcfa-chaos60 --recipes recipes/chaos-60s.yaml
+```
+
+These commands never play audio. Entropy defaults to RNGoddess with required
+`eshkol-local:moonlab`, via local drawd; source failures raise without a fallback.
+Dataset directories contain only `manifest.jsonl` and `midi/000/000000.mid`, with
+1000 IDs per shard. Manifest rows contain `id`, `path`, `sha256`, `recipe`,
+`preset`, `tempo`, `key`, `scale`, `time_signature`, `lanes`, `bars`, `duration_s`,
+and `note_count`. `lanes` is a list of lane configurations (range, channel,
+program, role and note count when known). Tempo is `{start}` for constant tempo,
+or `{start, min, max}` when it changes. MIDI track names are neutral `lane N`;
+recipe, preset and entropy-source labels never enter MIDI messages.
+
+Provenance logging is off by default. `--log /tmp/mcfa-run.jsonl` writes full
+lane/RNGoddess provenance, variation and tempo draws, layout, generator commit,
+and rejects to that external JSONL, with `/tmp/mcfa-run.jsonl.summary.md`.
+Paths inside the dataset (including through symlinks) are refused. The parser
+accepts `--log` to additionally check velocities, lengths, automation event counts
+and maximum tempo jumps against the run's provenance.
+
+Use `--resume` to reconcile the manifest against parsed MIDI, skip intact files,
+regenerate missing files and retain SHA256 deduplication. A missing or torn
+manifest is rebuilt atomically. Valid rows with matching hashes preserve their
+intent. Recovered orphan files take recipe/preset membership from ID order in the
+supplied recipe schedule; key, scale and configured ranges become `null` because
+MIDI does not encode that intent. Existing files in the previous `meta/` layout
+require a new output directory; recovery never silently deletes their logs.
+
+Recipes are YAML or JSON lists, or a mapping with one `recipes` list. Each recipe
+has `name`, `count`, optional `fixed` (MidiControls fields plus lanes, bars,
+duration, tempo_changes, tempo_change_range, tempo_max_jump, preset), and optional
+`vary` (VarySpec fields). Unknown fields and invalid ranges are errors.
+`keys`, `scales`, `time_signatures` and `program_choices` accept `all` in recipes.
+Other choices are explicit lists: `velocity_choices` contains pairs,
+`length_choices` contains sets of lengths in beats, `lane_range_choices` contains
+complete per-lane layouts, and `program_choices` contains per-lane program lists.
+Lane layouts/programs cycle when shorter than the selected lane count.
+
+For a single configuration, use `--count` instead of `--recipes`. For example:
+
+```bash
+.venv/bin/python tools/mcfa_dataset.py --count 10 --out /tmp/mcfa-timed \
+  --tempo 120 --tempo-changes 4 --tempo-change-range 40-220 \
+  --tempo-max-jump 50 --duration 60
+```
+
+`--tempo-changes N` adds N tempo events after the initial event at bar 0, evenly
+spaced over distinct interior bar boundaries. Values come from fresh entropy,
+constrained to the range and optional maximum BPM jump. `--duration` selects whole
+bars using the encoded tempo map, including trailing rests; tolerance is +/-2 s.
+Infeasible entropy-drawn maps are rejected and redrawn (at most 16 attempts per
+piece); each rejection is included in the optional log. Fixed infeasible targets
+and exhausted retries fail explicitly. The planner never stretches
+the tempo range or moves a tempo event off a boundary to force a fit.

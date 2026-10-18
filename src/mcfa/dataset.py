@@ -1,45 +1,36 @@
-"""Batch MIDI training-dataset generator built on tools/eshkol_midi.py.
+"""Silent MIDI datasets: only sharded MIDI and manifest.jsonl in the dataset.
 
-Layout under the output directory:
-    midi/NNNNNN.mid      one piece per file (written atomically)
-    meta/NNNNNN.json     params, per-lane provenance (+ RNGoddess manifests),
-                         MIDI sha256, note/track counts, duration
-    manifest.jsonl       one line per accepted piece (rebuilt from meta/ at the end)
-    rejects.jsonl        rejected attempts (malformed, empty, duplicate)
-    dataset_card.md      generated from facts only
-
-Musical controls come from mcfa.midi_controls (tempo, metre, key, scale,
-lane ranges, rests, velocity, lengths, programs). With vary=True, the fields
-named in a VarySpec are chosen per piece from the entropy source itself and
-every drawn value is logged in the piece metadata.
+Optional external JSONL logs hold provenance and rejected attempts. All musical
+entropy comes through the caller's draw function (normally RNGoddess/Eshkol).
+Recovery trusts parsed MIDI facts; absent intent is null, never guessed.
 """
-
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import asdict, replace
 import datetime as _dt
 import hashlib
 import importlib.util
 import io
 import json
 import os
+from pathlib import Path
 import subprocess
 import tempfile
-import time
-from pathlib import Path
 from typing import Any, Callable
 
 _TOOL = Path(__file__).resolve().parents[2] / "tools" / "eshkol_midi.py"
-SCHEMA = "mcfa-midi-dataset/v1"
-MAX_ATTEMPTS = 3
-
-# draw_fn(n_bytes, lane_id, piece_tag) -> (bytes, provenance entry dict)
+SCHEMA = "mcfa-midi-dataset/v2"
+MAX_ATTEMPTS = 16
 DrawFn = Callable[[int, int, str], tuple[bytes, dict]]
+MANIFEST_FIELDS = {"id", "path", "sha256", "recipe", "preset", "tempo", "key", "scale",
+                   "time_signature", "lanes", "bars", "duration_s", "note_count"}
 
 
 def _load_tool():
     spec = importlib.util.spec_from_file_location("eshkol_midi", _TOOL)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    spec.loader.exec_module(mod)
     return mod
 
 
@@ -60,241 +51,354 @@ def atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
-def validate_midi(data: bytes) -> dict[str, Any]:
-    """Re-parse with mido; raise ValueError if malformed or empty."""
-    import mido
+def midi_path(index: int) -> str:
+    return f"midi/{index // 1000:03d}/{index:06d}.mid"
 
+
+def _parse(data):
+    import mido
     try:
-        mid = mido.MidiFile(file=io.BytesIO(data))
-    except Exception as exc:  # noqa: BLE001
+        return mido.MidiFile(file=io.BytesIO(data))
+    except Exception as exc:
         raise ValueError(f"malformed MIDI: {exc}") from exc
-    notes = sum(1 for t in mid.tracks for m in t if m.type == "note_on" and m.velocity > 0)
-    if not mid.tracks or notes == 0:
+
+
+def validate_midi(data: bytes) -> dict[str, Any]:
+    mid = _parse(data)
+    notes = sum(m.type == "note_on" and m.velocity > 0 for t in mid.tracks for m in t)
+    if not mid.tracks or not notes:
         raise ValueError("empty MIDI (no notes)")
-    return {"tracks": len(mid.tracks), "notes": notes, "duration_s": round(mid.length, 3),
+    return {"tracks": len(mid.tracks), "notes": notes, "duration_s": mid.length,
             "ticks_per_beat": mid.ticks_per_beat, "midi_type": mid.type}
 
 
 def git_commit() -> str | None:
     try:
-        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=_TOOL.parent,
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_TOOL.parent,
                              capture_output=True, text=True, timeout=5)
         dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=_TOOL.parent,
                                capture_output=True, text=True, timeout=5).stdout.strip()
         return out.stdout.strip() + ("-dirty" if dirty else "") if out.returncode == 0 else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
 def default_draw_fn(rngoddess: bool, sources: list[str] | None, backend: str) -> DrawFn:
     if rngoddess:
         from .providers.mixer import RNGoddessMixer
-
-        def draw(n: int, lane: int, tag: str):
-            label = f"mcfa/v2/rngoddess/dataset/{tag}/" + ("params" if lane < 0 else f"lane/{lane:02d}")
-            m = RNGoddessMixer(sources, label=label)
-            data = m.read(n).data
-            return data, {"provider": "rngoddess", "manifest": m.provenance()}
+        def draw(n, lane, tag):
+            label = f"mcfa/v2/rngoddess/dataset/{tag}/" + (f"params/{lane}" if lane < 0 else f"lane/{lane:02d}")
+            mixer = RNGoddessMixer(sources, label=label)
+            data = mixer.read(n).data
+            return data, {"provider": "rngoddess", "manifest": mixer.provenance()}
         return draw
-
     from .providers.eshkol import draw_from_drawd
-
-    def draw(n: int, lane: int, tag: str):
+    def draw(n, lane, tag):
         return draw_from_drawd(n, backend=backend), {"provider": f"eshkol-{backend}"}
     return draw
 
 
-def _vary(draw: DrawFn, tag: str, base, spec, lanes: int, bars: int):
-    from .midi_controls import vary_controls
+def _checked_draw(draw):
+    def checked(n, lane, tag):
+        # Bounded provider reads permit long pieces without a PRNG expansion.
+        blocks, entries = [], []
+        for offset in range(0, n, 65536):
+            want = min(65536, n - offset)
+            data, entry = draw(want, lane, tag if n <= 65536 else f"{tag}/block/{offset // 65536}")
+            if len(data) != want:
+                from .providers.base import EntropyProviderError
+                raise EntropyProviderError(f"short entropy draw: {len(data)} bytes, expected {want}")
+            blocks.append(data)
+            entries.append(entry)
+        return b"".join(blocks), entries[0] if len(entries) == 1 else {"blocks": entries}
+    return checked
 
-    data, entry = draw(32, -1, tag)
-    controls, lanes, bars, drawn = vary_controls(base, spec, data, lanes, bars)
-    return controls, lanes, bars, {"drawn": drawn, "bytes": len(data),
-                                   "sha256": hashlib.sha256(data).hexdigest(), **entry}
+
+def _draw_info(data, entry):
+    return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), **entry}
 
 
-def generate_dataset(
-    out_dir: str | Path,
-    count: int,
-    *,
-    lanes: int = 4,
-    bars: int = 8,
-    vary: bool = False,
-    lanes_range: tuple[int, int] | None = (1, 8),
-    bars_range: tuple[int, int] | None = (4, 16),
-    controls=None,
-    vary_spec=None,
-    legacy: bool = False,
-    rngoddess: bool = True,
-    sources: list[str] | None = None,
-    backend: str = "moonlab",
-    seed_label: str = "piece",
-    resume: bool = False,
-    draw_fn: DrawFn | None = None,
-    log: Callable[[str], None] | None = None,
-) -> dict[str, Any]:
-    from .midi_controls import MidiControls, VarySpec
+def _facts(data, index):
+    """Recover only observable facts. Configured ranges/key/scale are intent."""
+    import mido
+    mid, stats = _parse(data), validate_midi(data)
+    tempos, signature, total = [], "4/4", 0
+    lanes = []
+    for lane, track in enumerate(mid.tracks):
+        tick, program, channel = 0, None, None
+        for msg in track:
+            tick += msg.time
+            if msg.type == "set_tempo":
+                tempos.append((tick, msg.tempo))
+            if msg.type == "time_signature":
+                signature = f"{msg.numerator}/{msg.denominator}"
+            if msg.type == "program_change":
+                program = msg.program
+            if hasattr(msg, "channel"):
+                channel = msg.channel
+        total = max(total, tick)
+        lanes.append({"lane": lane, "range": None, "channel": channel, "program": program})
+    tempos.sort()
+    if not tempos or tempos[0][0] > 0:
+        tempos.insert(0, (0, 500000))
+    bpms = [mido.tempo2bpm(t) for _, t in tempos]
+    tempo = {"start": bpms[0]}
+    if len(set(t for _, t in tempos)) > 1:
+        tempo.update(min=min(bpms), max=max(bpms))
+    num, den = map(int, signature.split("/"))
+    bars = total / (mid.ticks_per_beat * num * 4 / den)
+    return {"id": f"{index:06d}", "path": midi_path(index), "sha256": hashlib.sha256(data).hexdigest(),
+            "recipe": None, "preset": None, "tempo": tempo, "key": None, "scale": None,
+            "time_signature": signature, "lanes": lanes, "bars": int(bars) if bars.is_integer() else bars,
+            "duration_s": stats["duration_s"], "note_count": stats["notes"]}
 
-    tool = _load_tool()
-    if legacy and vary_spec is not None and any(
-            getattr(vary_spec, f) for f in ("tempo_range", "scales", "keys", "time_signatures", "rest_range")):
-        raise ValueError("legacy mode cannot vary musical controls")
-    base_controls = None if legacy else (controls or MidiControls()).validate()
-    if vary:
-        vary_spec = vary_spec or VarySpec()
-        if vary_spec.lanes_range is None:
-            vary_spec.lanes_range = lanes_range
-        if vary_spec.bars_range is None:
-            vary_spec.bars_range = bars_range
-    out = Path(out_dir)
-    (out / "midi").mkdir(parents=True, exist_ok=True)
-    (out / "meta").mkdir(parents=True, exist_ok=True)
-    if any((out / "meta").glob("*.json")) and not resume:
-        raise FileExistsError(f"{out} already has pieces; pass resume=True to continue")
-    if rngoddess and sources is None:
-        sources = ["eshkol-local:moonlab"]
-    draw = draw_fn or default_draw_fn(rngoddess, sources, backend)
-    source_desc = {"mode": "rngoddess" if rngoddess else "single-source",
-                   "sources": sources if rngoddess else [f"eshkol-local:{backend}"]}
 
-    seen: dict[str, str] = {}
-    for meta_path in sorted((out / "meta").glob("*.json")):
-        meta = json.loads(meta_path.read_text())
-        seen[meta["midi_sha256"]] = meta["id"]
+def _write_manifest(out, rows):
+    atomic_write(out / "manifest.jsonl", "".join(json.dumps(rows[k], sort_keys=True) + "\n" for k in sorted(rows)).encode())
 
-    made = skipped = rejected = 0
-    times: list[float] = []
-    for i in range(count):
-        pid = f"{i:06d}"
-        midi_path, meta_path = out / "midi" / f"{pid}.mid", out / "meta" / f"{pid}.json"
-        if meta_path.exists() and midi_path.exists():
-            skipped += 1
-            continue
-        t0 = time.monotonic()
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            tag = f"{seed_label}-{pid}" + (f"-r{attempt}" if attempt > 1 else "")
-            params: dict[str, Any] = {"lanes": lanes, "bars": bars, "vary": vary, "legacy": legacy}
-            piece_controls = base_controls
-            if vary:
-                if legacy:
-                    from .midi_controls import vary_controls  # lanes/bars only
-                    data0, entry0 = draw(32, -1, tag)
-                    _, params["lanes"], params["bars"], drawn = vary_controls(
-                        MidiControls(), vary_spec, data0, lanes, bars)
-                    params["vary_draw"] = {"drawn": drawn, "bytes": len(data0),
-                                           "sha256": hashlib.sha256(data0).hexdigest(), **entry0}
-                else:
-                    piece_controls, params["lanes"], params["bars"], params["vary_draw"] = _vary(
-                        draw, tag, base_controls, vary_spec, lanes, bars)
-                params["vary_spec"] = {k: v for k, v in vars(vary_spec).items() if v}
-            params["controls"] = None if piece_controls is None else piece_controls.public()
-            mid, prov = tool.generate_midi(params["lanes"], params["bars"], seed_tag=tag,
-                                           draw_fn=lambda n, lane: draw(n, lane, tag),
-                                           controls=piece_controls, legacy=legacy)
-            buf = io.BytesIO()
-            mid.save(file=buf)
-            data = buf.getvalue()
-            sha = hashlib.sha256(data).hexdigest()
-            reason = None
+
+def _recover(out, schedule):
+    saved = {}
+    manifest = out / "manifest.jsonl"
+    if manifest.exists():
+        for line in manifest.read_text(errors="replace").splitlines():
             try:
-                stats = validate_midi(data)
-            except ValueError as exc:
-                reason = str(exc)
-            if reason is None and sha in seen:
-                reason = f"duplicate of {seen[sha]}"
-            if reason is None:
+                row = json.loads(line)
+                if isinstance(row, dict) and MANIFEST_FIELDS <= row.keys():
+                    saved[row["id"]] = row
+            except (ValueError, KeyError, TypeError):
+                continue
+    rows, seen = {}, {}
+    for path in sorted((out / "midi").rglob("*.mid")):
+        if not path.stem.isdigit():
+            raise ValueError(f"unexpected MIDI filename: {path}")
+        index = int(path.stem)
+        if path.relative_to(out).as_posix() != midi_path(index):
+            raise ValueError(f"unsharded MIDI {path}; expected {midi_path(index)}")
+        data = path.read_bytes()
+        row = _facts(data, index)
+        old = saved.get(row["id"])
+        if old and old["sha256"] == row["sha256"] and old["path"] == row["path"]:
+            for key in ("recipe", "preset", "key", "scale", "lanes"):
+                row[key] = old[key]
+        elif index < len(schedule):
+            row["recipe"], row["preset"] = schedule[index][0:2]
+        if row["sha256"] in seen:
+            raise ValueError(f"existing duplicate MIDI: {row['id']} and {seen[row['sha256']]}")
+        seen[row["sha256"]] = row["id"]
+        rows[index] = row
+    return rows, seen
+
+
+class _Log:
+    def __init__(self, path, out):
+        self.path = Path(path).resolve() if path is not None else None
+        if self.path and (self.path == out or out in self.path.parents):
+            raise ValueError("log path must be outside the dataset directory")
+        self.card = self.path.with_name(self.path.name + ".summary.md") if self.path else None
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, event):
+        if self.path:
+            # Recover a torn trailing log record before appending the next record.
+            if self.path.exists():
+                with self.path.open("rb+") as f:
+                    data = f.read()
+                    if data and not data.endswith(b"\n"):
+                        f.truncate(data.rfind(b"\n") + 1)
+            with self.path.open("ab") as f:
+                f.write((json.dumps(event, sort_keys=True) + "\n").encode())
+                f.flush()
+                os.fsync(f.fileno())
+
+    def summarize(self, summary, rows):
+        if self.path:
+            self.write({"event": "summary", **summary})
+            tempos = [r["tempo"]["start"] for r in rows.values()]
+            card = (f"# MCFA dataset generation log\n\n- Pieces: {summary['pieces']}\n"
+                    f"- Distinct SHA256: {summary['distinct_sha256']}\n"
+                    f"- Rejected this run: {summary['rejected']}\n"
+                    f"- Recipes: {json.dumps(summary['recipes'], sort_keys=True)}\n"
+                    f"\n## Musical controls\n\n- Tempo (BPM), starts: {min(tempos) if tempos else '-'} to {max(tempos) if tempos else '-'}\n")
+            atomic_write(self.card, card.encode())
+
+
+def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
+                     lanes_range=(1, 8), bars_range=(4, 16), controls=None, vary_spec=None,
+                     legacy=False, rngoddess=True, sources=None, backend="moonlab", seed_label="piece",
+                     resume=False, draw_fn=None, log=None, progress=None, recipes=None,
+                     duration=None, tempo_changes=0, tempo_change_range=None, tempo_max_jump=None,
+                     preset=None):
+    from .midi_controls import MidiControls, VarySpec, vary_controls
+    from .midi_timing import plan_timing
+    from .recipes import Recipe, load_recipes, parse_recipes, recipe_controls
+
+    out = Path(out_dir).resolve()
+    # A callback remains supported as a progress sink for existing API clients.
+    if callable(log):
+        progress, log = log, None
+    logger = _Log(log, out)
+    base = (controls or MidiControls()).validate()
+    if type(lanes) is not int or not 1 <= lanes <= 16 or type(bars) is not int or bars < 1:
+        raise ValueError("lanes must be 1..16 and bars must be >= 1")
+    if sources and not rngoddess:
+        raise ValueError("sources require RNGoddess mode")
+    spec = replace(vary_spec) if vary_spec else VarySpec()
+    if vary:
+        if spec.lanes_range is None:
+            spec.lanes_range = lanes_range
+        if spec.bars_range is None:
+            spec.bars_range = bars_range
+    spec.validate()
+    if recipes is not None:
+        if count is not None:
+            raise ValueError("use recipe counts or count, not both")
+        if legacy:
+            raise ValueError("recipes require musical controls (no legacy)")
+        recipe_list = load_recipes(recipes) if isinstance(recipes, (str, Path)) else recipes
+        if not (isinstance(recipe_list, list) and all(isinstance(r, Recipe) for r in recipe_list)):
+            recipe_list = parse_recipes(recipe_list)
+    else:
+        if type(count) is not int or count < 1:
+            raise ValueError("count must be a positive integer")
+        recipe_list = [Recipe(None, count, {}, spec if vary else VarySpec())]
+    schedule = []
+    for recipe in recipe_list:
+        fixed = {"lanes": lanes, "bars": bars, "duration": duration, "tempo_changes": tempo_changes,
+                 "tempo_change_range": tempo_change_range, "tempo_max_jump": tempo_max_jump, "preset": preset} | recipe.fixed
+        ctl = recipe_controls(base, recipe.fixed)
+        vs = recipe.vary.validate()
+        if legacy and (fixed["duration"] is not None or fixed["tempo_changes"] or any(
+                v is not None for k, v in asdict(vs).items() if k not in ("lanes_range", "bars_range"))):
+            raise ValueError("legacy mode cannot use duration or musical variation")
+        # Validate timing and fixed dimensions before writing any files/drawing entropy.
+        if type(fixed["lanes"]) is not int or not 1 <= fixed["lanes"] <= 16 or type(fixed["bars"]) is not int or fixed["bars"] < 1:
+            raise ValueError("invalid recipe lanes/bars")
+        check_ctl = replace(ctl, tempo=sum(vs.tempo_range) / 2) if vs.tempo_range else ctl
+        if type(fixed["tempo_changes"]) is not int or not 0 <= fixed["tempo_changes"] <= 1024:
+            raise ValueError("tempo_changes must be an integer in 0..1024")
+        plan_timing(check_ctl, max(fixed["bars"], fixed["tempo_changes"] + 1) if fixed["duration"] else fixed["bars"],
+                    fixed["tempo_changes"], fixed["tempo_change_range"], fixed["tempo_max_jump"],
+                    bytes(fixed["tempo_changes"] * 2), None if fixed["tempo_changes"] or any(v is not None for v in asdict(vs).values()) else fixed["duration"])
+        schedule.extend([(recipe.name, fixed["preset"], fixed, ctl, vs)] * recipe.count)
+    existing = (out / "manifest.jsonl").exists() or any((out / "midi").rglob("*.mid"))
+    if existing and not resume:
+        raise FileExistsError(f"{out} already has pieces; pass resume=True to continue")
+    # Refuse old layout rather than deleting someone's previous provenance.
+    if any((out / name).exists() for name in ("meta", "dataset_card.md", "rejects.jsonl")):
+        raise ValueError("old dataset layout present; use a new output directory")
+    if out.exists() and any(p.name not in ("midi", "manifest.jsonl") for p in out.iterdir()):
+        raise ValueError("dataset directory contains files other than MIDI and manifest")
+    rows, seen = _recover(out, schedule) if resume else ({}, {})
+    for i, row in rows.items():
+        if i < len(schedule) and row["recipe"] != schedule[i][0]:
+            raise ValueError("recipe schedule differs from existing manifest")
+    out.mkdir(parents=True, exist_ok=True)
+    _write_manifest(out, rows)
+    draw = _checked_draw(draw_fn or default_draw_fn(rngoddess, sources, backend))
+    tool, commit = _load_tool(), git_commit()
+    logger.write({"event": "run", "schema": SCHEMA, "generator_commit": commit,
+                  "source": {"rngoddess": rngoddess, "sources": (sources or ["eshkol-local:moonlab"]) if rngoddess else [f"eshkol-local:{backend}"]},
+                  "schedule": [{"name": r.name, "count": r.count, "fixed": r.fixed, "vary": asdict(r.vary)} for r in recipe_list]})
+    made = skipped = rejected = 0
+    try:
+        for index, (name, piece_preset, fixed, ctl, vs) in enumerate(schedule):
+            if index in rows:
+                skipped += 1
+                continue
+            pid = f"{index:06d}"
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                tag = f"{seed_label}-{pid}" + (f"-r{attempt}" if attempt > 1 else "")
+                piece_ctl, nlanes, nbars = ctl, fixed["lanes"], fixed["bars"]
+                params = {"legacy": legacy, "vary": {}, "tempo_draw": None}
+                if any(v is not None for v in asdict(vs).values()):
+                    data0, entry0 = draw(32, -1, tag)
+                    piece_ctl, nlanes, nbars, drawn = vary_controls(ctl, vs, data0, nlanes, nbars)
+                    params["vary"] = {"drawn": drawn, **_draw_info(data0, entry0)}
+                drawn = params["vary"].get("drawn", {})
+                changes = drawn.get("tempo_changes", fixed["tempo_changes"])
+                jump = drawn.get("tempo_max_jump", fixed["tempo_max_jump"])
+                td = b""
+                if changes:
+                    td, te = draw(changes * 2, -2, tag)
+                    params["tempo_draw"] = _draw_info(td, te)
+                bounds = fixed["tempo_change_range"] or vs.tempo_range
+                try:
+                    nbars, timing = plan_timing(piece_ctl, nbars, changes, bounds, jump, td, fixed["duration"])
+                except ValueError as exc:
+                    # Entropy may produce an infeasible whole-bar duration; reject
+                    # that attempt. Provider exceptions always propagate immediately.
+                    if not (changes or any(v is not None for v in asdict(vs).values())):
+                        raise
+                    rejected += 1
+                    logger.write({"event": "reject", "id": pid, "recipe": name, "preset": piece_preset,
+                                  "attempt": attempt, "seed_label": tag, "reason": str(exc),
+                                  "params": params | {"controls": piece_ctl.public(), "tempo_changes": changes,
+                                                      "tempo_change_range": bounds, "tempo_max_jump": jump,
+                                                      "duration_target": fixed["duration"]}, "generator_commit": commit})
+                    if progress:
+                        progress(f"reject {pid} attempt {attempt}: {exc}")
+                    continue
+                params.update(lanes=nlanes, bars=nbars, controls=None if legacy else piece_ctl.public(),
+                              tempo_map=timing, duration_target=fixed["duration"], tempo_max_jump=jump)
+                events = [(round(bar * piece_ctl.beats_per_bar * 480), tempo) for bar, tempo in timing]
+                mid, prov = tool.generate_midi(nlanes, nbars, seed_tag=tag,
+                    draw_fn=lambda n, lane: draw(n, lane, tag), controls=piece_ctl, legacy=legacy,
+                    tempo_events=None if legacy else events)
+                buf = io.BytesIO()
+                mid.save(file=buf)
+                data, reason = buf.getvalue(), None
+                sha = hashlib.sha256(data).hexdigest()
+                try:
+                    stats = validate_midi(data)
+                    if fixed["duration"] is not None and abs(stats["duration_s"] - fixed["duration"]) > 2:
+                        raise ValueError("duration outside +/-2 s")
+                except ValueError as exc:
+                    reason = str(exc)
+                if reason is None and sha in seen:
+                    reason = f"duplicate of {seen[sha]}"
+                record = {"id": pid, "recipe": name, "preset": piece_preset, "attempt": attempt,
+                          "seed_label": tag, "sha256": sha, "params": params,
+                          "lanes_provenance": prov["draws"], "lane_layout": prov.get("lane_layout", []),
+                          "generator_commit": commit, "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat()}
+                if reason:
+                    rejected += 1
+                    logger.write({"event": "reject", "reason": reason, **record})
+                    if progress:
+                        progress(f"reject {pid} attempt {attempt}: {reason}")
+                    continue
                 break
-            rejected += 1
-            with open(out / "rejects.jsonl", "a") as f:
-                f.write(json.dumps({"id": pid, "attempt": attempt, "tag": tag, "reason": reason,
-                                    "midi_sha256": sha}) + "\n")
-            if log:
-                log(f"reject {pid} attempt {attempt}: {reason}")
-        else:
-            raise RuntimeError(f"piece {pid} rejected {MAX_ATTEMPTS} times; see rejects.jsonl")
-
-        meta = {
-            "schema": SCHEMA, "id": pid, "seed_label": tag, "attempt": attempt,
-            "params": params, "source": source_desc,
-            "midi": f"midi/{pid}.mid", "midi_sha256": sha, "midi_bytes": len(data), **stats,
-            "lanes_provenance": prov["draws"],
-            "lane_layout": prov.get("lane_layout", []),
-            "generator": {"tool": "tools/eshkol_midi.py", "commit": git_commit()},
-            "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
-        }
-        atomic_write(midi_path, data)
-        atomic_write(meta_path, json.dumps(meta, indent=2).encode())
-        seen[sha] = pid
-        made += 1
-        times.append(time.monotonic() - t0)
-        if log:
-            log(f"{pid}: {stats['notes']} notes, {stats['duration_s']} s, {params['lanes']} lanes x {params['bars']} bars")
-
-    summary = finalize(out)
-    summary.update({"made": made, "skipped": skipped, "rejected": rejected,
-                    "seconds_per_piece": round(sum(times) / len(times), 3) if times else None})
+            else:
+                raise RuntimeError(f"piece {pid} rejected {MAX_ATTEMPTS} times")
+            row = _facts(data, index)
+            row.update(recipe=name, preset=piece_preset, key=None if legacy else piece_ctl.key,
+                       scale=None if legacy else piece_ctl.scale,
+                       lanes=prov["lane_layout"] if not legacy else row["lanes"])
+            atomic_write(out / row["path"], data)
+            rows[index], seen[sha] = row, pid
+            _write_manifest(out, rows)
+            logger.write({"event": "piece", "manifest": row, **record})
+            made += 1
+            if progress:
+                progress(f"{pid}: {row['note_count']} notes, {row['duration_s']:.3f} s")
+    except Exception as exc:
+        logger.write({"event": "error", "error": str(exc), "generator_commit": commit})
+        logger.summarize(finalize(out, rows) | {"made": made, "skipped": skipped, "rejected": rejected}, rows)
+        raise
+    summary = finalize(out, rows)
+    summary.update(made=made, skipped=skipped, rejected=rejected)
+    logger.summarize(summary, rows)
     return summary
 
 
-def finalize(out: Path) -> dict[str, Any]:
-    """Rebuild manifest.jsonl and dataset_card.md from meta/ (facts only)."""
-    metas = [json.loads(p.read_text()) for p in sorted((out / "meta").glob("*.json"))]
-    lines = "".join(json.dumps({k: m[k] for k in ("id", "midi", "midi_sha256", "notes", "duration_s",
-                                                   "tracks", "seed_label", "params", "source")}) + "\n"
-                    for m in metas)
-    atomic_write(out / "manifest.jsonl", lines.encode())
-    n = len(metas)
-    rng = lambda key, f=lambda m, k: m[k]: (min(f(m, key) for m in metas), max(f(m, key) for m in metas)) if metas else (None, None)
-    p = lambda m, k: m["params"][k]
-    sources = sorted({json.dumps(m["source"], sort_keys=True) for m in metas})
-    commits = sorted({str(m["generator"]["commit"]) for m in metas})
-    rejects = out / "rejects.jsonl"
-    nrej = len(rejects.read_text().splitlines()) if rejects.exists() else 0
-    total = sum(m["midi_bytes"] for m in metas)
-    ctl = [m["params"].get("controls") for m in metas if m["params"].get("controls")]
-
-    def counts(key):
-        c: dict[str, int] = {}
-        for x in ctl:
-            c[str(x[key])] = c.get(str(x[key]), 0) + 1
-        return ", ".join(f"{k} ({v})" for k, v in sorted(c.items())) or "-"
-    tempos = [x["tempo"] for x in ctl]
-    controls_md = "" if not ctl else f"""
-## Musical controls
-
-- Tempo (BPM): {min(tempos)} - {max(tempos)}
-- Scales: {counts('scale')}
-- Keys: {counts('key')}
-- Time signatures: {counts('time_signature')}
-- Rest probability: {min(x['rest_probability'] for x in ctl)} - {max(x['rest_probability'] for x in ctl)}
-- Velocity ranges: {counts('velocity')}
-- Note lengths (beats): {counts('lengths')}
-"""
-    legacy_n = sum(1 for m in metas if m["params"].get("legacy"))
-    card = f"""# MCFA MIDI dataset
-
-- Generated: {_dt.date.today().isoformat()}
-- Schema: {SCHEMA}
-- Pieces: {n} (distinct MIDI sha256: {len({m['midi_sha256'] for m in metas})})
-- Rejected attempts: {nrej}
-- Total MIDI size: {total} bytes
-- Format: Standard MIDI File type {metas[0]['midi_type'] if metas else '-'}, {metas[0]['ticks_per_beat'] if metas else '-'} ticks per beat, one track per lane
-- Generator: tools/eshkol_midi.py via src/mcfa/dataset.py, commit(s) {', '.join(commits) or '-'}
-- Entropy source(s): {'; '.join(sources) or '-'}
-
-## Ranges
-
-| field | min | max |
-|---|---|---|
-| lanes | {rng('lanes', p)[0]} | {rng('lanes', p)[1]} |
-| bars | {rng('bars', p)[0]} | {rng('bars', p)[1]} |
-| notes | {rng('notes')[0]} | {rng('notes')[1]} |
-| duration (s) | {rng('duration_s')[0]} | {rng('duration_s')[1]} |
-| tracks | {rng('tracks')[0]} | {rng('tracks')[1]} |
-
-{controls_md}{f"Legacy (C1-C8 chromatic) pieces: {legacy_n}" + chr(10) if legacy_n else ""}
-Files: `midi/NNNNNN.mid`, `meta/NNNNNN.json`, `manifest.jsonl`{', `rejects.jsonl`' if nrej else ''}.
-"""
-    atomic_write(out / "dataset_card.md", card.encode())
-    return {"pieces": n, "distinct_sha256": len({m["midi_sha256"] for m in metas}), "total_bytes": total,
-            "notes_range": rng("notes"), "duration_range": rng("duration_s"), "rejects_total": nrej}
+def finalize(out, rows=None):
+    out = Path(out)
+    if rows is None:
+        rows, _ = _recover(out, [])
+    _write_manifest(out, rows)
+    durations = [r["duration_s"] for r in rows.values()]
+    return {"pieces": len(rows), "distinct_sha256": len({r["sha256"] for r in rows.values()}),
+            "total_bytes": sum((out / r["path"]).stat().st_size for r in rows.values()),
+            "duration_range": [min(durations), max(durations)] if durations else [None, None],
+            "recipes": dict(Counter(r["recipe"] or "unlabelled" for r in rows.values()))}

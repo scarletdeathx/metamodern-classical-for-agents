@@ -70,14 +70,20 @@ def bytes_to_notes(data: bytes, lane_id: int) -> list[dict]:
     return notes
 
 
-def _emit_track(track, notes, channel, mido, end_tick=None) -> None:
+def _emit_track(track, notes, channel, mido, end_tick=None, tempo_events=None) -> None:
     events = []
     for n in notes:
         events.append((n["start_tick"], 1, "on", n))
         events.append((n["start_tick"] + n["duration_ticks"], 0, "off", n))
+    for tick, tempo in tempo_events or []:
+        events.append((tick, -1, "tempo", tempo))
     events.sort(key=lambda e: (e[0], e[1]))
     last_tick = 0
     for tick, _, kind, n in events:
+        if kind == "tempo":
+            track.append(mido.MetaMessage("set_tempo", tempo=n, time=tick - last_tick))
+            last_tick = tick
+            continue
         track.append(mido.Message(
             "note_on" if kind == "on" else "note_off", note=n["pitch"],
             velocity=n["velocity"] if kind == "on" else 0, time=tick - last_tick, channel=channel,
@@ -98,6 +104,7 @@ def generate_midi(
     draw_fn=None,
     controls: MidiControls | None = None,
     legacy: bool = False,
+    tempo_events: list[tuple[int, int]] | None = None,
 ) -> tuple["mido.MidiFile", dict]:
     """Generate a multi-lane MIDI file from Eshkol draws.
 
@@ -144,7 +151,7 @@ def generate_midi(
         })
 
         track = mido.MidiTrack()
-        track.name = f"eshkol-lane-{lane_id:02d}"
+        track.name = f"lane {lane_id}"
         mid.tracks.append(track)
         if legacy:
             channel = lane_id % 16
@@ -159,7 +166,8 @@ def generate_midi(
             channel = midi_channel(lane_id)
             if lane_id == 0:
                 num, den = (int(x) for x in controls.time_signature.split("/"))
-                track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(controls.tempo), time=0))
+                if tempo_events is None:
+                    track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(controls.tempo), time=0))
                 track.append(mido.MetaMessage("time_signature", numerator=num, denominator=den, time=0))
             program = controls.program(lane_id)
             if program is not None:
@@ -170,7 +178,8 @@ def generate_midi(
                 "lane": lane_id, "role": controls.role(lane_id), "range": [lo, hi],
                 "channel": channel, "program": program, "notes": len(notes),
             })
-        _emit_track(track, notes, channel, mido, end_tick=None if legacy else total_ticks)
+        _emit_track(track, notes, channel, mido, end_tick=None if legacy else total_ticks,
+                    tempo_events=tempo_events if lane_id == 0 else None)
 
     return mid, provenance
 
