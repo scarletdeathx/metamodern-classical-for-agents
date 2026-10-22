@@ -287,3 +287,57 @@ Infeasible entropy-drawn maps are rejected and redrawn (at most 16 attempts per
 piece); each rejection is included in the optional log. Fixed infeasible targets
 and exhausted retries fail explicitly. The planner never stretches
 the tempo range or moves a tempo event off a boundary to force a fit.
+
+### Dense, changing MIDI (nightmare)
+
+```bash
+.venv/bin/python tools/mcfa_dataset.py --recipes recipes/nightmare-60s.yaml \
+  --out /path/to/new-dataset --log /path/to/logs/nightmare.jsonl
+.venv/bin/python tools/verify_dataset.py /path/to/new-dataset \
+  --recipes recipes/nightmare-60s.yaml --log /path/to/logs/nightmare.jsonl
+```
+
+This opt-in recipe contains 1,000 pieces targeting 60 +/-2 seconds. It draws
+quarter-beat tempo changes across 20–400 BPM, quarter-beat keys and chords from
+all keys/scales, and eighth-beat modulation (CC1), reverb (CC91), chorus (CC93)
+and pitch bend independently per lane. Velocity comes from fresh bytes for each
+note. Each lane selects one GM program at its start. There are **no** events for
+volume (CC7), expression (CC11), pan (CC10), sustain (CC64), or filter (CC71/74).
+
+Recipes enable this path with `fixed.motion`, a mapping of `MotionControls`
+fields: `min_notes_per_sec`, `max_gap_s`, `note_step_beats`,
+`tempo_interval_beats`, `harmony_interval_beats`, `cc_interval_beats`,
+`pitch_bend_interval_beats`, `harmony_keys`, `harmony_scales`, and `chord_sizes`.
+Omitted automation intervals disable that automation. `harmony_keys` and
+`harmony_scales` accept `all` or explicit lists. Intervals are quarter-note beats
+on the 480 PPQ grid; chord sizes are 1–4 notes per lane. Changing harmony requires
+at least two eligible keys, unique non-percussion channels (at most 15 lanes),
+and lane ranges spanning at least an octave. Bar-based change counts/jump limits
+cannot be combined with this path; use the tempo interval and range instead.
+The corresponding CLI flags are available for `--count` jobs, e.g.:
+
+```bash
+.venv/bin/python tools/mcfa_dataset.py --count 3 --out /tmp/dense-midi \
+  --duration 60 --tempo-change-range 20-400 --min-notes-per-sec 15 \
+  --max-gap-s 0.25 --tempo-interval-beats 0.25 --harmony-interval-beats 0.25 \
+  --cc-interval-beats 0.125 --pitch-bend-interval-beats 0.125
+```
+
+An entropy-driven full chord in lane 0 anchors the density and gap guarantees;
+other lanes retain the rest probability and entropy-driven gates. Onset spacing
+adapts in seconds to the encoded tempo map. The generator re-parses the serialized
+MIDI and rejects files violating the minimum density or maximum silence gap.
+Silence means no active note across the piece, including leading/trailing time;
+this is measured from MIDI note gates, not an acoustic prediction about a GM
+instrument's envelope. No playback is used to establish these measurements.
+
+Schema v3 adds parsed `notes_per_sec`, `max_gap_s`, `tempo_change_count`,
+`cc_events_per_sec`, and `pitch_bend_events_per_sec` to every newly generated row.
+Motion rows additionally retain a `motion` configuration. `key` and `scale` mean
+the initial harmony for motion pieces; subsequent keys are standard MIDI key
+signature events. The exact scale/chord timeline and entropy provenance live in
+the optional external log, enabling strict note-by-note harmony verification.
+The verifier reports when that log is absent instead of claiming exact harmonic
+compliance. Recipe/preset/source labels never enter MIDI. Resume still reads
+v2 manifests, preserves intent in matching rows, and rebuilds the new parsed
+metrics. Existing dataset directories are not migrated in place.

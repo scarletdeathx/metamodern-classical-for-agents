@@ -12,7 +12,9 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from mcfa.dataset import MANIFEST_FIELDS, midi_path
+from mcfa.dataset import BASE_MANIFEST_FIELDS, MANIFEST_FIELDS, OPTIONAL_MANIFEST_FIELDS, midi_path
+from mcfa.midi_motion_verify import verify_motion
+from statistics import median
 from mcfa.midi_controls import KEYS, SCALES
 from mcfa.recipes import load_recipes
 
@@ -44,11 +46,12 @@ def verify_dataset(out, recipes=None, log=None):
             "MIDI inventory differs from manifest")
     seen, ids, durations, total_notes, compliant, automated, change_counts = set(), set(), [], 0, 0, 0, []
     extrema, control_values = [], {k: set() for k in ("key", "scale", "time_signature", "lanes", "bars", "start_tempo", "program")}
+    motion_results = []
     targets = {r.name: r.fixed.get("duration") for r in recipe_list}
     fixed = {r.name: r.fixed for r in recipe_list}
     for row in rows:
         pid = row["id"]
-        require(set(row) == MANIFEST_FIELDS, f"{pid}: wrong manifest fields")
+        require(BASE_MANIFEST_FIELDS <= set(row) <= MANIFEST_FIELDS | OPTIONAL_MANIFEST_FIELDS, f"{pid}: wrong manifest fields")
         require(pid not in ids, f"duplicate ID {pid}")
         ids.add(pid)
         require(row["path"] == midi_path(int(pid)), f"{pid}: wrong shard path")
@@ -67,6 +70,26 @@ def verify_dataset(out, recipes=None, log=None):
         durations.append(mid.length)
         num, den = map(int, row["time_signature"].split("/"))
         bar_ticks = num * 4 / den * mid.ticks_per_beat
+        if row.get("motion"):
+            logged = provenance.get(pid)
+            if log:
+                require(logged is not None, f"{pid}: missing provenance")
+            result = verify_motion(mid, row, logged, fixed.get(row["recipe"], {}))
+            motion_results.append(result)
+            total_notes += row["note_count"]
+            compliant += row["note_count"] if logged or not row["motion"].get("harmony_interval_beats") else 0
+            bpms = result["tempo_bpms"]
+            extrema.extend(bpms)
+            automated += len(bpms) > 1
+            change_counts.append(row["tempo_change_count"])
+            for field in ("key", "scale", "time_signature", "bars"):
+                control_values[field].add(row[field])
+            control_values["key"].update(result["keys"])
+            control_values["scale"].update(result["scales"])
+            control_values["lanes"].add(len(row["lanes"]))
+            control_values["start_tempo"].add(row["tempo"]["start"])
+            control_values["program"].update(lane["program"] for lane in row["lanes"] if lane["program"] is not None)
+            continue
         classes = {(KEYS.index(row["key"]) + i) % 12 for i in SCALES[row["scale"]]}
         note_count, tempos, signatures = 0, [], []
         logged = provenance.get(pid)
@@ -133,9 +156,23 @@ def verify_dataset(out, recipes=None, log=None):
         control_values["lanes"].add(len(row["lanes"]))
         control_values["start_tempo"].add(row["tempo"]["start"])
     require(len(rows) > 0, "empty dataset")
-    return {"pieces": len(rows), "recipes": dict(counts), "distinct_sha256": len(seen),
+    def distribution(values):
+        return {"min": min(values), "median": median(values), "max": max(values)}
+    motion_summary = {}
+    if motion_results:
+        motion_summary = {"motion": {
+            **{name: distribution([r["metrics"][name] for r in motion_results])
+               for name in ("notes_per_sec", "max_gap_s", "tempo_change_count", "cc_events_per_sec", "pitch_bend_events_per_sec")},
+            "max_onset_gap_s": distribution([r["max_onset_gap_s"] for r in motion_results]),
+            "harmony_change_count": distribution([r["harmony_change_count"] for r in motion_results]),
+            "key_change_count": distribution([r["key_change_count"] for r in motion_results]),
+            "cc_counts": dict(sum((Counter(r["cc_counts"]) for r in motion_results), Counter())),
+            "steady_cc_events": 0, "mid_piece_program_changes": 0,
+            "harmony_verified_from_log": bool(log),
+        }}
+    return {**motion_summary, "pieces": len(rows), "recipes": dict(counts), "distinct_sha256": len(seen),
             "notes": total_notes, "notes_in_scale_and_range": compliant,
-            "compliance_percent": 100 * compliant / total_notes,
+            "compliance_percent": 100 * compliant / total_notes if not motion_results or log else None,
             "duration_s": {"min": min(durations), "max": max(durations), "mean": sum(durations)/len(durations)},
             "tempo_bpm": {"min": min(extrema), "max": max(extrema)}, "automated_pieces": automated,
             "tempo_changes": {"min": min(change_counts), "max": max(change_counts)},

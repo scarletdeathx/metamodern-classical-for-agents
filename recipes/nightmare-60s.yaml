@@ -1,0 +1,30 @@
+recipes:
+  - name: nightmare-60s
+    count: 1000
+    fixed:
+      duration: 60
+      tempo_change_range: [20, 400]
+      rest_probability: 0.01
+      velocity: [1, 127]
+      programs: [0, 40, 80, 127]
+      motion:
+        min_notes_per_sec: 15
+        max_gap_s: 0.25
+        note_step_beats: 0.125
+        tempo_interval_beats: 0.25
+        harmony_interval_beats: 0.25
+        cc_interval_beats: 0.125
+        pitch_bend_interval_beats: 0.125
+        harmony_keys: all
+        harmony_scales: all
+        chord_sizes: [2, 3, 4]
+    vary:
+      tempo_range: [20, 400]
+      keys: all
+      scales: all
+      time_signatures: all
+      lanes_range: [4, 8]
+      lane_range_choices:
+        - [[12, 60], [24, 84], [48, 108], [72, 127]]
+        - [[24, 72], [36, 84], [48, 96], [60, 108]]
+      program_choices: all

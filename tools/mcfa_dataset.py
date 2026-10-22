@@ -49,6 +49,17 @@ def main(argv=None) -> int:
     ap.add_argument("--tempo-change-range", help="automation BPM MIN-MAX")
     ap.add_argument("--tempo-max-jump", type=float, help="maximum BPM change per automation event")
     ap.add_argument("--out", required=True)
+    motion = ap.add_argument_group("dense motion (opt-in; recipes use fixed.motion)")
+    motion.add_argument("--min-notes-per-sec", type=float)
+    motion.add_argument("--max-gap-s", type=float)
+    motion.add_argument("--note-step-beats", type=float)
+    motion.add_argument("--tempo-interval-beats", type=float)
+    motion.add_argument("--harmony-interval-beats", type=float)
+    motion.add_argument("--cc-interval-beats", type=float)
+    motion.add_argument("--pitch-bend-interval-beats", type=float)
+    motion.add_argument("--harmony-keys", help="comma list or all")
+    motion.add_argument("--harmony-scales", help="comma list or all")
+    motion.add_argument("--chord-sizes", help="comma list, 1..4 notes per lane chord")
     ap.add_argument("--lanes", type=int, default=4)
     ap.add_argument("--bars", type=int, default=8)
     ap.add_argument("--vary", action="store_true",
@@ -108,6 +119,15 @@ def main(argv=None) -> int:
     if not args.vary and any(vars(spec).values()):
         ap.error("variation flags need --vary")
     try:
+        motion_fields = ("min_notes_per_sec", "max_gap_s", "note_step_beats", "tempo_interval_beats",
+                         "harmony_interval_beats", "cc_interval_beats", "pitch_bend_interval_beats")
+        motion_config = {k: getattr(args, k) for k in motion_fields if getattr(args, k) is not None}
+        for field in ("harmony_keys", "harmony_scales"):
+            value = getattr(args, field)
+            if value:
+                motion_config[field] = "all" if value == "all" else value.split(",")
+        if args.chord_sizes:
+            motion_config["chord_sizes"] = [int(x) for x in args.chord_sizes.split(",")]
         controls = None if args.legacy else eshkol_midi.controls_from_args(args)
         summary = generate_dataset(
             args.out, args.count, lanes=args.lanes, bars=args.bars, vary=args.vary,
@@ -117,7 +137,7 @@ def main(argv=None) -> int:
             legacy=args.legacy, recipes=args.recipes, duration=args.duration,
             tempo_changes=args.tempo_changes,
             tempo_change_range=tuple(float(x) for x in args.tempo_change_range.split("-")) if args.tempo_change_range else None,
-            tempo_max_jump=args.tempo_max_jump)
+            tempo_max_jump=args.tempo_max_jump, motion=motion_config or None)
     except Exception as exc:
         print(f"dataset failed: {exc}", file=sys.stderr)
         return 1

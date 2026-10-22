@@ -20,11 +20,14 @@ import tempfile
 from typing import Any, Callable
 
 _TOOL = Path(__file__).resolve().parents[2] / "tools" / "eshkol_midi.py"
-SCHEMA = "mcfa-midi-dataset/v2"
+SCHEMA = "mcfa-midi-dataset/v3"
 MAX_ATTEMPTS = 16
 DrawFn = Callable[[int, int, str], tuple[bytes, dict]]
-MANIFEST_FIELDS = {"id", "path", "sha256", "recipe", "preset", "tempo", "key", "scale",
+BASE_MANIFEST_FIELDS = {"id", "path", "sha256", "recipe", "preset", "tempo", "key", "scale",
                    "time_signature", "lanes", "bars", "duration_s", "note_count"}
+from .midi_analysis import METRIC_FIELDS, analyze_midi
+MANIFEST_FIELDS = BASE_MANIFEST_FIELDS | METRIC_FIELDS
+OPTIONAL_MANIFEST_FIELDS = {"motion"}
 
 
 def _load_tool():
@@ -63,13 +66,17 @@ def _parse(data):
         raise ValueError(f"malformed MIDI: {exc}") from exc
 
 
-def validate_midi(data: bytes) -> dict[str, Any]:
-    mid = _parse(data)
+def _stats(mid):
     notes = sum(m.type == "note_on" and m.velocity > 0 for t in mid.tracks for m in t)
     if not mid.tracks or not notes:
         raise ValueError("empty MIDI (no notes)")
-    return {"tracks": len(mid.tracks), "notes": notes, "duration_s": mid.length,
-            "ticks_per_beat": mid.ticks_per_beat, "midi_type": mid.type}
+    analysis = analyze_midi(mid)
+    return {"tracks": len(mid.tracks), "notes": notes, "duration_s": analysis["duration_s"],
+            "ticks_per_beat": mid.ticks_per_beat, "midi_type": mid.type, **analysis["metrics"]}
+
+
+def validate_midi(data: bytes) -> dict[str, Any]:
+    return _stats(_parse(data))
 
 
 def git_commit() -> str | None:
@@ -118,10 +125,11 @@ def _draw_info(data, entry):
     return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), **entry}
 
 
-def _facts(data, index):
+def _facts(data, index, *, mid=None, stats=None):
     """Recover only observable facts. Configured ranges/key/scale are intent."""
     import mido
-    mid, stats = _parse(data), validate_midi(data)
+    mid = mid if mid is not None else _parse(data)
+    stats = stats if stats is not None else _stats(mid)
     tempos, signature, total = [], "4/4", 0
     lanes = []
     for lane, track in enumerate(mid.tracks):
@@ -150,7 +158,8 @@ def _facts(data, index):
     return {"id": f"{index:06d}", "path": midi_path(index), "sha256": hashlib.sha256(data).hexdigest(),
             "recipe": None, "preset": None, "tempo": tempo, "key": None, "scale": None,
             "time_signature": signature, "lanes": lanes, "bars": int(bars) if bars.is_integer() else bars,
-            "duration_s": stats["duration_s"], "note_count": stats["notes"]}
+            "duration_s": stats["duration_s"], "note_count": stats["notes"],
+            **{k: stats[k] for k in METRIC_FIELDS}}
 
 
 def _write_manifest(out, rows):
@@ -164,7 +173,7 @@ def _recover(out, schedule):
         for line in manifest.read_text(errors="replace").splitlines():
             try:
                 row = json.loads(line)
-                if isinstance(row, dict) and MANIFEST_FIELDS <= row.keys():
+                if isinstance(row, dict) and BASE_MANIFEST_FIELDS <= row.keys():
                     saved[row["id"]] = row
             except (ValueError, KeyError, TypeError):
                 continue
@@ -181,8 +190,12 @@ def _recover(out, schedule):
         if old and old["sha256"] == row["sha256"] and old["path"] == row["path"]:
             for key in ("recipe", "preset", "key", "scale", "lanes"):
                 row[key] = old[key]
+            if "motion" in old:
+                row["motion"] = old["motion"]
         elif index < len(schedule):
             row["recipe"], row["preset"] = schedule[index][0:2]
+            if schedule[index][2].get("motion"):
+                row["motion"] = schedule[index][2]["motion"]
         if row["sha256"] in seen:
             raise ValueError(f"existing duplicate MIDI: {row['id']} and {seen[row['sha256']]}")
         seen[row["sha256"]] = row["id"]
@@ -204,9 +217,22 @@ class _Log:
             # Recover a torn trailing log record before appending the next record.
             if self.path.exists():
                 with self.path.open("rb+") as f:
-                    data = f.read()
-                    if data and not data.endswith(b"\n"):
-                        f.truncate(data.rfind(b"\n") + 1)
+                    size = f.seek(0, os.SEEK_END)
+                    if size:
+                        f.seek(size - 1)
+                        if f.read(1) != b"\n":
+                            offset = size
+                            while offset:
+                                start = max(0, offset - 4096)
+                                f.seek(start)
+                                block = f.read(offset - start)
+                                found = block.rfind(b"\n")
+                                if found >= 0:
+                                    f.truncate(start + found + 1)
+                                    break
+                                offset = start
+                            else:
+                                f.truncate(0)
             with self.path.open("ab") as f:
                 f.write((json.dumps(event, sort_keys=True) + "\n").encode())
                 f.flush()
@@ -229,9 +255,10 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
                      legacy=False, rngoddess=True, sources=None, backend="moonlab", seed_label="piece",
                      resume=False, draw_fn=None, log=None, progress=None, recipes=None,
                      duration=None, tempo_changes=0, tempo_change_range=None, tempo_max_jump=None,
-                     preset=None):
+                     preset=None, motion=None):
     from .midi_controls import MidiControls, VarySpec, vary_controls
     from .midi_timing import plan_timing
+    from .midi_motion import MotionControls, enforce_contract, generate_motion_midi
     from .recipes import Recipe, load_recipes, parse_recipes, recipe_controls
 
     out = Path(out_dir).resolve()
@@ -266,9 +293,15 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
     schedule = []
     for recipe in recipe_list:
         fixed = {"lanes": lanes, "bars": bars, "duration": duration, "tempo_changes": tempo_changes,
-                 "tempo_change_range": tempo_change_range, "tempo_max_jump": tempo_max_jump, "preset": preset} | recipe.fixed
+                 "tempo_change_range": tempo_change_range, "tempo_max_jump": tempo_max_jump, "preset": preset, "motion": motion} | recipe.fixed
         ctl = recipe_controls(base, recipe.fixed)
         vs = recipe.vary.validate()
+        if fixed.get("motion") is not None:
+            fixed["motion"] = MotionControls(**fixed["motion"]).validate().public()
+            if legacy:
+                raise ValueError("motion controls cannot use legacy MIDI")
+            if fixed["tempo_changes"] or vs.tempo_changes_range or fixed["tempo_max_jump"] is not None or vs.tempo_jump_range:
+                raise ValueError("use motion tempo intervals without bar-based tempo changes or jump limits")
         if legacy and (fixed["duration"] is not None or fixed["tempo_changes"] or any(
                 v is not None for k, v in asdict(vs).items() if k not in ("lanes_range", "bars_range"))):
             raise ValueError("legacy mode cannot use duration or musical variation")
@@ -280,7 +313,7 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
             raise ValueError("tempo_changes must be an integer in 0..1024")
         plan_timing(check_ctl, max(fixed["bars"], fixed["tempo_changes"] + 1) if fixed["duration"] else fixed["bars"],
                     fixed["tempo_changes"], fixed["tempo_change_range"], fixed["tempo_max_jump"],
-                    bytes(fixed["tempo_changes"] * 2), None if fixed["tempo_changes"] or any(v is not None for v in asdict(vs).values()) else fixed["duration"])
+                    bytes(fixed["tempo_changes"] * 2), None if fixed.get("motion") is not None or fixed["tempo_changes"] or any(v is not None for v in asdict(vs).values()) else fixed["duration"])
         schedule.extend([(recipe.name, fixed["preset"], fixed, ctl, vs)] * recipe.count)
     existing = (out / "manifest.jsonl").exists() or any((out / "midi").rglob("*.mid"))
     if existing and not resume:
@@ -324,34 +357,60 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
                     td, te = draw(changes * 2, -2, tag)
                     params["tempo_draw"] = _draw_info(td, te)
                 bounds = fixed["tempo_change_range"] or vs.tempo_range
-                try:
-                    nbars, timing = plan_timing(piece_ctl, nbars, changes, bounds, jump, td, fixed["duration"])
-                except ValueError as exc:
-                    # Entropy may produce an infeasible whole-bar duration; reject
-                    # that attempt. Provider exceptions always propagate immediately.
-                    if not (changes or any(v is not None for v in asdict(vs).values())):
-                        raise
-                    rejected += 1
-                    logger.write({"event": "reject", "id": pid, "recipe": name, "preset": piece_preset,
-                                  "attempt": attempt, "seed_label": tag, "reason": str(exc),
-                                  "params": params | {"controls": piece_ctl.public(), "tempo_changes": changes,
-                                                      "tempo_change_range": bounds, "tempo_max_jump": jump,
-                                                      "duration_target": fixed["duration"]}, "generator_commit": commit})
-                    if progress:
-                        progress(f"reject {pid} attempt {attempt}: {exc}")
-                    continue
-                params.update(lanes=nlanes, bars=nbars, controls=None if legacy else piece_ctl.public(),
-                              tempo_map=timing, duration_target=fixed["duration"], tempo_max_jump=jump)
-                events = [(round(bar * piece_ctl.beats_per_bar * 480), tempo) for bar, tempo in timing]
-                mid, prov = tool.generate_midi(nlanes, nbars, seed_tag=tag,
-                    draw_fn=lambda n, lane: draw(n, lane, tag), controls=piece_ctl, legacy=legacy,
-                    tempo_events=None if legacy else events)
+                if fixed.get("motion") is not None:
+                    motion_draws = []
+                    def motion_draw(n, lane):
+                        data, entry = draw(n, lane, tag)
+                        motion_draws.append({"lane": lane, **_draw_info(data, entry)})
+                        return data, entry
+                    try:
+                        mid, prov = generate_motion_midi(nlanes, nbars, piece_ctl, fixed["motion"],
+                            motion_draw, duration=fixed["duration"], tempo_range=bounds)
+                    except ValueError as exc:
+                        rejected += 1
+                        logger.write({"event": "reject", "id": pid, "recipe": name, "attempt": attempt,
+                                      "reason": str(exc), "params": params, "motion_draws": motion_draws, "generator_commit": commit})
+                        if progress:
+                            progress(f"reject {pid} attempt {attempt}: {exc}")
+                        continue
+                    nbars = prov["bars"]
+                    params.update(lanes=nlanes, bars=nbars, controls=piece_ctl.public(),
+                                  duration_target=fixed["duration"], tempo_max_jump=None,
+                                  motion=prov["motion"], harmony=prov["harmony"],
+                                  tempo_map_ticks=prov["tempo_map_ticks"], tempo_draw=prov["tempo_draw"],
+                                  harmony_draw=prov["harmony_draw"])
+                else:
+                    try:
+                        nbars, timing = plan_timing(piece_ctl, nbars, changes, bounds, jump, td, fixed["duration"])
+                    except ValueError as exc:
+                        # Entropy may produce an infeasible whole-bar duration; reject
+                        # that attempt. Provider exceptions always propagate immediately.
+                        if not (changes or any(v is not None for v in asdict(vs).values())):
+                            raise
+                        rejected += 1
+                        logger.write({"event": "reject", "id": pid, "recipe": name, "preset": piece_preset,
+                                      "attempt": attempt, "seed_label": tag, "reason": str(exc),
+                                      "params": params | {"controls": piece_ctl.public(), "tempo_changes": changes,
+                                                          "tempo_change_range": bounds, "tempo_max_jump": jump,
+                                                          "duration_target": fixed["duration"]}, "generator_commit": commit})
+                        if progress:
+                            progress(f"reject {pid} attempt {attempt}: {exc}")
+                        continue
+                    params.update(lanes=nlanes, bars=nbars, controls=None if legacy else piece_ctl.public(),
+                                  tempo_map=timing, duration_target=fixed["duration"], tempo_max_jump=jump)
+                    events = [(round(bar * piece_ctl.beats_per_bar * 480), tempo) for bar, tempo in timing]
+                    mid, prov = tool.generate_midi(nlanes, nbars, seed_tag=tag,
+                        draw_fn=lambda n, lane: draw(n, lane, tag), controls=piece_ctl, legacy=legacy,
+                        tempo_events=None if legacy else events)
                 buf = io.BytesIO()
                 mid.save(file=buf)
                 data, reason = buf.getvalue(), None
                 sha = hashlib.sha256(data).hexdigest()
                 try:
                     stats = validate_midi(data)
+                    if fixed.get("motion") is not None:
+                        # Enforce the contract on the serialized, re-parsed file.
+                        enforce_contract(_parse(data), MotionControls(**fixed["motion"]).validate())
                     if fixed["duration"] is not None and abs(stats["duration_s"] - fixed["duration"]) > 2:
                         raise ValueError("duration outside +/-2 s")
                 except ValueError as exc:
@@ -371,10 +430,14 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
                 break
             else:
                 raise RuntimeError(f"piece {pid} rejected {MAX_ATTEMPTS} times")
-            row = _facts(data, index)
+            row = _facts(data, index, mid=mid, stats=stats)
             row.update(recipe=name, preset=piece_preset, key=None if legacy else piece_ctl.key,
                        scale=None if legacy else piece_ctl.scale,
                        lanes=prov["lane_layout"] if not legacy else row["lanes"])
+            if fixed.get("motion") is not None:
+                row["motion"] = prov["motion"]
+                if prov["harmony"]:
+                    row["key"], row["scale"] = prov["harmony"][0]["key"], prov["harmony"][0]["scale"]
             atomic_write(out / row["path"], data)
             rows[index], seen[sha] = row, pid
             _write_manifest(out, rows)

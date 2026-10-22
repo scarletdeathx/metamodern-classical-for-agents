@@ -8,7 +8,7 @@ from pathlib import Path
 from .midi_controls import KEYS, SCALES, TIME_SIGNATURES, MidiControls, VarySpec
 
 PARAMS = {f.name for f in fields(MidiControls)} | {
-    "lanes", "bars", "duration", "tempo_changes", "tempo_change_range", "tempo_max_jump", "preset"}
+    "lanes", "bars", "duration", "tempo_changes", "tempo_change_range", "tempo_max_jump", "preset", "motion"}
 ALL_CHOICES = {"keys": KEYS, "scales": sorted(SCALES), "time_signatures": TIME_SIGNATURES}
 
 
@@ -50,6 +50,9 @@ def parse_recipes(document) -> list[Recipe]:
             varying["program_choices"] = [[i] for i in range(128)]
         try:
             spec = VarySpec(**varying).validate()
+            if "motion" in fixed:
+                from .midi_motion import MotionControls
+                MotionControls(**fixed["motion"]).validate()
             MidiControls(**{k: v for k, v in fixed.items() if k in {f.name for f in fields(MidiControls)}}).validate()
         except (TypeError, ValueError) as exc:
             raise ValueError(f"bad recipe {name}: {exc}") from exc
