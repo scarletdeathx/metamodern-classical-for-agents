@@ -255,13 +255,21 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
                      legacy=False, rngoddess=True, sources=None, backend="moonlab", seed_label="piece",
                      resume=False, draw_fn=None, log=None, progress=None, recipes=None,
                      duration=None, tempo_changes=0, tempo_change_range=None, tempo_max_jump=None,
-                     preset=None, motion=None):
+                     preset=None, motion=None, chunked=False):
     from .midi_controls import MidiControls, VarySpec, vary_controls
     from .midi_timing import plan_timing
     from .midi_motion import MotionControls, enforce_contract, generate_motion_midi
     from .recipes import Recipe, load_recipes, parse_recipes, recipe_controls
 
+    if chunked and resume:
+        raise ValueError("chunked output never skips pieces; --resume is not supported")
     out = Path(out_dir).resolve()
+    if chunked and out.exists() and any(out.iterdir()):
+        raise FileExistsError(f"chunked output requires a new empty directory: {out}")
+    chunk_run = None
+    if chunked:
+        from .chunked import ChunkedRun, ChunkedOutputError
+        chunk_run = ChunkedRun(out)
     # A callback remains supported as a progress sink for existing API clients.
     if callable(log):
         progress, log = log, None
@@ -341,7 +349,7 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
                 skipped += 1
                 continue
             pid = f"{index:06d}"
-            for attempt in range(1, MAX_ATTEMPTS + 1):
+            for attempt in range(1, (1 if chunked else MAX_ATTEMPTS) + 1):
                 tag = f"{seed_label}-{pid}" + (f"-r{attempt}" if attempt > 1 else "")
                 piece_ctl, nlanes, nbars = ctl, fixed["lanes"], fixed["bars"]
                 params = {"legacy": legacy, "vary": {}, "tempo_draw": None}
@@ -367,6 +375,8 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
                         mid, prov = generate_motion_midi(nlanes, nbars, piece_ctl, fixed["motion"],
                             motion_draw, duration=fixed["duration"], tempo_range=bounds)
                     except ValueError as exc:
+                        if chunked:
+                            raise
                         rejected += 1
                         logger.write({"event": "reject", "id": pid, "recipe": name, "attempt": attempt,
                                       "reason": str(exc), "params": params, "motion_draws": motion_draws, "generator_commit": commit})
@@ -385,7 +395,7 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
                     except ValueError as exc:
                         # Entropy may produce an infeasible whole-bar duration; reject
                         # that attempt. Provider exceptions always propagate immediately.
-                        if not (changes or any(v is not None for v in asdict(vs).values())):
+                        if chunked or not (changes or any(v is not None for v in asdict(vs).values())):
                             raise
                         rejected += 1
                         logger.write({"event": "reject", "id": pid, "recipe": name, "preset": piece_preset,
@@ -415,13 +425,15 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
                         raise ValueError("duration outside +/-2 s")
                 except ValueError as exc:
                     reason = str(exc)
-                if reason is None and sha in seen:
+                if reason is None and not chunked and sha in seen:
                     reason = f"duplicate of {seen[sha]}"
                 record = {"id": pid, "recipe": name, "preset": piece_preset, "attempt": attempt,
                           "seed_label": tag, "sha256": sha, "params": params,
                           "lanes_provenance": prov["draws"], "lane_layout": prov.get("lane_layout", []),
                           "generator_commit": commit, "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat()}
                 if reason:
+                    if chunked:
+                        raise ValueError(reason)
                     rejected += 1
                     logger.write({"event": "reject", "reason": reason, **record})
                     if progress:
@@ -438,7 +450,13 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
                 row["motion"] = prov["motion"]
                 if prov["harmony"]:
                     row["key"], row["scale"] = prov["harmony"][0]["key"], prov["harmony"][0]["scale"]
-            atomic_write(out / row["path"], data)
+            if chunked:
+                _, files = chunk_run.write_piece(pid, data)
+                row["source_sha256"] = row.pop("sha256")
+                row.pop("path")
+                row["chunks"] = files
+            else:
+                atomic_write(out / row["path"], data)
             rows[index], seen[sha] = row, pid
             _write_manifest(out, rows)
             logger.write({"event": "piece", "manifest": row, **record})
@@ -446,21 +464,44 @@ def generate_dataset(out_dir, count=None, *, lanes=4, bars=8, vary=False,
             if progress:
                 progress(f"{pid}: {row['note_count']} notes, {row['duration_s']:.3f} s")
     except Exception as exc:
+        if chunked:
+            message = str(exc) if isinstance(exc, ChunkedOutputError) else f"piece {pid}: {exc}"
+            try:
+                logger.write({"event": "error", "error": message, "generator_commit": commit})
+                logger.summarize(finalize(out, rows, chunk_run=chunk_run) |
+                                 {"made": made, "skipped": 0, "rejected": 0}, rows)
+            except Exception as report_exc:
+                raise ChunkedOutputError(pid, f"{message}; report/log failure: {report_exc}") from exc
+            if isinstance(exc, ChunkedOutputError):
+                raise
+            raise ChunkedOutputError(pid, str(exc) or type(exc).__name__) from exc
         logger.write({"event": "error", "error": str(exc), "generator_commit": commit})
         logger.summarize(finalize(out, rows) | {"made": made, "skipped": skipped, "rejected": rejected}, rows)
         raise
-    summary = finalize(out, rows)
-    summary.update(made=made, skipped=skipped, rejected=rejected)
-    logger.summarize(summary, rows)
-    return summary
+    try:
+        summary = finalize(out, rows, chunk_run=chunk_run)
+        summary.update(made=made, skipped=skipped, rejected=rejected)
+        logger.summarize(summary, rows)
+        return summary
+    except Exception as exc:
+        if chunked:
+            raise ChunkedOutputError(pid, str(exc) or type(exc).__name__) from exc
+        raise
 
 
-def finalize(out, rows=None):
+def finalize(out, rows=None, *, chunk_run=None):
     out = Path(out)
     if rows is None:
         rows, _ = _recover(out, [])
     _write_manifest(out, rows)
     durations = [r["duration_s"] for r in rows.values()]
+    if chunk_run is not None:
+        report = chunk_run.finish()
+        return {"pieces": len(rows), "distinct_sha256": report["summary"]["distinct_mid_sha256"],
+                "total_bytes": sum(c["mid_bytes"] for p in report["pieces"] for c in p["chunks"]),
+                "duration_range": [min(durations), max(durations)] if durations else [None, None],
+                "recipes": dict(Counter(r["recipe"] or "unlabelled" for r in rows.values())),
+                "chunks_total": report["summary"]["chunks_total"], "chunk_report": str(out / "chunk-report.json")}
     return {"pieces": len(rows), "distinct_sha256": len({r["sha256"] for r in rows.values()}),
             "total_bytes": sum((out / r["path"]).stat().st_size for r in rows.values()),
             "duration_range": [min(durations), max(durations)] if durations else [None, None],

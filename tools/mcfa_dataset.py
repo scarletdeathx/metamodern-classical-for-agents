@@ -43,6 +43,7 @@ def main(argv=None) -> int:
     choice = ap.add_mutually_exclusive_group(required=True)
     choice.add_argument("--count", type=int)
     choice.add_argument("--recipes", help="YAML/JSON recipe file; counts are taken from recipes")
+    ap.add_argument("--chunked", action="store_true", help="write exact MIDITokenizerV2 .mid/.npy chunks instead of long MIDI; no retries, dedupe or resume")
     ap.add_argument("--log", help="optional provenance JSONL outside dataset; also writes PATH.summary.md")
     ap.add_argument("--duration", type=float, help="target seconds, whole bars, tolerance +/-2 s")
     ap.add_argument("--tempo-changes", type=int, default=0, help="N additional set_tempo events at bar boundaries")
@@ -137,7 +138,7 @@ def main(argv=None) -> int:
             legacy=args.legacy, recipes=args.recipes, duration=args.duration,
             tempo_changes=args.tempo_changes,
             tempo_change_range=tuple(float(x) for x in args.tempo_change_range.split("-")) if args.tempo_change_range else None,
-            tempo_max_jump=args.tempo_max_jump, motion=motion_config or None)
+            tempo_max_jump=args.tempo_max_jump, motion=motion_config or None, chunked=args.chunked)
     except Exception as exc:
         print(f"dataset failed: {exc}", file=sys.stderr)
         return 1

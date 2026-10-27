@@ -341,3 +341,56 @@ The verifier reports when that log is absent instead of claiming exact harmonic
 compliance. Recipe/preset/source labels never enter MIDI. Resume still reads
 v2 manifests, preserves intent in matching rows, and rebuilds the new parsed
 metrics. Existing dataset directories are not migrated in place.
+
+### Opt-in training chunks
+
+```bash
+.venv/bin/python -m pip install -e '.[chunked]'
+.venv/bin/python tools/mcfa_dataset.py --count 3 --out /path/to/new-chunks --chunked
+# Also works with --recipes and the existing musical controls.
+```
+
+Without `--chunked`, generation and output retain the existing path. The optional
+chunker and its dependencies are loaded only when the flag is used. This mode
+writes each generated source piece directly to matching pairs:
+
+```text
+midi/000/000000_chunk000.mid
+tokens/000/000000_chunk000.npy
+manifest.jsonl
+chunk-report.json
+```
+
+There is no long source `.mid` in chunked output. The manifest retains the
+source-piece musical metadata and labels, `source_sha256`, and a `chunks` list
+with MIDI/token paths, hashes and row counts. `chunk-report.json` uses exactly
+the `summary`/`pieces` fields of the supplied VM `reports/chunk-canon.json`.
+Optional full provenance still goes to the external `--log` path.
+
+Cuts and serialization follow the supplied VM `chunk_canon.py:process()`:
+SkyTNT MIDITokenizerV2, `set_optimise_midi(True)`, `tokenize(score, tempo_eps=0)`,
+default `cc_eps=4`, and BOS/EOS. With `MAX_LEN=2048`, `MARGIN=16`, the body capacity
+is `2048-16-2-len(header)`. Header state is the latest time signature, per-track
+key signatures, tempo, per-track/channel patches and per-track/channel/controller
+CC values, rebased to time zero and stably sorted by `(track, ORDER)`. Only the
+first body's `time1` delta becomes zero; its fractional `time2` is retained,
+exactly as in the oracle. Bodies are consecutive with no overlap, dropped tail,
+padding or final-chunk merging. Coverage assertions reconstruct the complete
+**tokenized** body, including restoration of the source boundary deltas.
+
+The `.npy` files contain int16 token rows written by NumPy, and MIDI bytes come
+from the exact supplied `MIDI.score2midi(tokenizer.detokenize(rows))`. Every
+serialized MIDI is re-tokenized and must have at most 2048 rows before any files
+from that piece are published. Short outputs and duplicate pieces/chunks are
+retained. Chunked mode uses a fresh empty output directory, refuses `--resume`,
+and stops at the first error with the piece ID; it never redraws, substitutes or
+skips another piece. Individual writes remain atomic.
+
+The exact tokenizer has its own normalization: it quantizes notes, remaps tracks
+and channels, detects keys, coalesces CC changes below 4, and does not support
+pitch bend or arbitrary MIDI metadata. These behaviors are preserved to match
+the reference; MCFA adds no extra filtering. Coverage therefore refers to the
+reference token rows, not a lossless archive of raw MIDI events. The unmodified
+upstream tokenizer/codec and source hashes are recorded in
+`src/mcfa/_vendor/skytnt/UPSTREAM.md`, with the upstream license. Visualization
+and augmentation/random routines are never called.
