@@ -2,7 +2,6 @@
 
 Date: 2026-10-27 (America/Los_Angeles).
 
-Repository: `/Users/scarletdeath/Downloads/masocore/Codex/PYBEAT`.
 Branch: `codex/chunked-output`, created from `nightmare-dataset` at
 `5db9f5ac3953c7a05b3187f462ea0db0c1000c2c` after inspecting the working tree and
 preserving the unfinished prior-work checkpoint.

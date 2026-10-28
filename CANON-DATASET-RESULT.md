@@ -2,8 +2,7 @@
 
 Date: 2026-10-17 (America/Los_Angeles).
 
-Repository: `/Users/scarletdeath/Downloads/masocore/Codex/PYBEAT` (the filesystem
-name has no ` (MCFA)` suffix). Branch: `canon-dataset`, created directly from
+Branch: `canon-dataset`, created directly from
 `midi-musical-controls` at `598a6e866173895bf6f3b0951f9e6f2d0cd989c6`.
 
 **Implementation and tested generator commit:**
